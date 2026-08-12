@@ -15,7 +15,7 @@ An open head injury with visible brain matter. The casualty is still drawing occ
 ### Attempt 1 — initial draft
 
 - **Declared**: Gray · **Derived**: Red
-- **Vitals**: HR 44 · RR 6 (distress threshold 30) · SpO2 72% · BP 52/30 (pulse-absent below 70) · consciousness 0.02 (altered below 0.5) · hemorrhage insult 0 · survivable True · minor-injuries-only False
+- **Vitals**: HR 44 · RR 6 (distress threshold 30) · SpO2 72% · BP 52/30 (pulse-absent below 70) · consciousness 0.02 (altered below 0.5) · hemorrhage insult 0 · tourniquet window 120s · survivable True · minor-injuries-only False
 - **Authoring note**: Open head injury with agonal respirations. Vitals are a clinically plausible placeholder — SME validation pending. Expectant given the resources on scene; comfort care only.
 
 - **`R1_SALT_MISMATCH`**
@@ -26,8 +26,9 @@ An open head injury with visible brain matter. The casualty is still drawing occ
 ### Attempt 2 — refiner revision 1
 
 - **Declared**: Gray · **Derived**: Red
-- **Vitals**: HR 44 · RR 6 (distress threshold 30) · SpO2 72% · BP 52/30 (pulse-absent below 70) · consciousness 0.02 (altered below 0.5) · hemorrhage insult 0 · survivable True · minor-injuries-only False
+- **Vitals**: HR 44 · RR 6 (distress threshold 30) · SpO2 72% · BP 52/30 (pulse-absent below 70) · consciousness 0.02 (altered below 0.5) · hemorrhage insult 0 · tourniquet window 120s · survivable True · minor-injuries-only False
 - **Authoring note**: Open head injury with agonal respirations. Vitals are a clinically plausible placeholder — SME validation pending. Expectant given the resources on scene; comfort care only. Reviewed again (revision 1); the authored presentation is believed correct as written.
+- **Changed since attempt 1**: AuthoringNote gained …' Reviewed again (revision 1); the authored presentation is believed correct as written.'
 
 - **`R1_SALT_MISMATCH`**
   - Rule: A row's declared SALT category must equal the category derived from that row's own authored vitals. The ground-truth category is derived live from physiology, never author-placed.

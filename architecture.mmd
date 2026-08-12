@@ -1,5 +1,5 @@
 flowchart TD
-    KB[("knowledge_base/ — copied in, self-contained<br/><b>Read at runtime:</b> casualty-archetype-schema.md<br/>(Group 1-7 field spec) + the real one-row<br/>DT_CasualtyArchetypes CSV<br/><b>Shipped as cited authority:</b> 6 further GDD<br/>and data-rule documents")]
+    KB[("knowledge_base/ — copied in, self-contained<br/><b>Read at runtime:</b> casualty-archetype-schema.md<br/>(Group 1-7 field spec) + the real one-row<br/>DT_CasualtyArchetypes CSV<br/><b>Shipped as cited authority:</b> 7 further GDD<br/>and data-rule documents")]
     REQ["requests.py<br/>(7 archetype requests<br/>spanning the SALT space)"]
 
     subgraph GEN["Generate (generator.py)"]
@@ -45,9 +45,11 @@ flowchart TD
     WRITE[["write_outputs — runs in a finally,<br/>so a run that dies mid-way still<br/>ships everything completed"]]
 
     WRITE --> CSV[("output/DT_CasualtyArchetypes.generated.csv<br/>accepted rows only, 24 columns,<br/>header identical to the exemplar")]
+    WRITE --> NOTES[("output/DT_CasualtyArchetypes.generated.notes.md<br/>the CSV's sibling notes file — placeholder<br/>labelling and per-row provenance the<br/>24 columns cannot carry")]
     WRITE --> JSON[("output/archetypes.json<br/>rows + triage_intent")]
     WRITE -->|"every draft, every finding"| LOG[("output/ger_log.md")]
     WRITE --> ESCFILE[("output/escalations/&lt;key&gt;.md<br/>trip reason + attempt history<br/>+ the decision a human must make")]
     WRITE --> SUMMARY[("output/run_summary.json")]
 
     CSV --> GAME["Golden Hour (UE 5.8)<br/>DT_CasualtyArchetypes<br/>casualty archetype rows"]
+    NOTES -.->|"provenance travels with the file"| GAME

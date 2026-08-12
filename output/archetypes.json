@@ -191,7 +191,7 @@
       "InitialConsciousness01": 0.0,
       "bMinorInjuriesOnly": false,
       "bSurvivableWithResources": false,
-      "AuthoringNote": "Apneic after one airway-reposition attempt. Vitals are a clinically plausible placeholder — SME validation pending representing arrest at spawn."
+      "AuthoringNote": "Apneic after one airway-reposition attempt; the row represents arrest at spawn. Vitals are a clinically plausible placeholder — SME validation pending."
     }
   },
   {

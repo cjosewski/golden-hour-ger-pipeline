@@ -11,6 +11,11 @@ There are two levels:
 * **Per item** (`ItemBreakerState` + `should_trip`) — this item is not
   converging.
 * **Per run** (`RunBreaker`) — the run itself is unhealthy and should stop.
+
+Both levels distinguish a *content* problem (the row keeps breaking a rule) from
+a *transport* problem (the role call never returned a usable reply). They are
+different failures with different fixes, and reporting one as the other sends
+whoever reads the escalation to the wrong place.
 """
 
 from __future__ import annotations
@@ -25,9 +30,19 @@ from dataclasses import dataclass, field
 # =========================================================================
 
 MAX_REFINE_ATTEMPTS = 3
+MAX_TRANSPORT_FAILURES = 2  # role calls that returned nothing usable, per item
 TRIP_ON_NO_PROGRESS = True  # same violation-code set twice running
 TRIP_ON_REGRESSION = True  # violation count grew vs the previous attempt
 RUN_ABORT_ESCALATION_RATIO = 0.5
+
+# Every transport trip reason starts with this, so a report writer can tell a
+# transport escalation from a content escalation without parsing prose.
+TRANSPORT_TRIP_PREFIX = "transport failure"
+
+
+def is_transport_trip(reason: str) -> bool:
+    """True when a trip reason describes a failed role call, not a bad row."""
+    return reason.startswith(TRANSPORT_TRIP_PREFIX)
 
 
 @dataclass
@@ -38,11 +53,22 @@ class ItemBreakerState:
     oldest first — including the initial draft's evaluation. Sets rather than
     lists because two attempts raising the same rules in a different order have
     made no progress, and the breaker must see that as identical.
+
+    ``transport_failures`` counts attempts where the role call itself failed —
+    a rate limit, a dropped connection, a reply that was not JSON. Those are
+    deliberately **not** in ``history``. The orchestrator turns them into a
+    synthetic ``GEN_INVALID_JSON`` violation so the loop has something to
+    record, and two of those in a row used to look identical to the no-progress
+    rule, which would then report a network outage as "the refiner is returning
+    an equivalent draft rather than reconciling the finding" — a confident
+    diagnosis of a problem that does not exist, about a draft that was never
+    produced. They are counted separately and tripped separately instead.
     """
 
     key: str
     attempts: int = 0
     history: list[frozenset[str]] = field(default_factory=list)
+    transport_failures: int = 0
 
 
 def should_trip(state: ItemBreakerState) -> tuple[bool, str]:
@@ -50,11 +76,32 @@ def should_trip(state: ItemBreakerState) -> tuple[bool, str]:
 
     The reason string is written to be read by a person in an escalation report,
     not parsed, so it explains the judgement rather than naming the constant.
-    Checked in priority order: budget first, then stagnation, then regression.
+    Checked in priority order: transport, then budget, then stagnation, then
+    regression.
     """
 
-    # 1. Attempt budget. Checked first because it is the unconditional ceiling —
-    #    no amount of promising-looking movement buys a fourth attempt.
+    # 0. Transport. Checked first because when it fires, nothing below it has
+    #    any evidence to reason about: no draft was produced, so no rule was
+    #    evaluated. Failure stance, stated deliberately: **fail closed**. The
+    #    item escalates to a human unchecked rather than being accepted
+    #    unchecked, because a row nobody evaluated is exactly the row this
+    #    pipeline exists to keep out of the DataTable. The wording says
+    #    "transport", never "the refiner will not learn" — misdiagnosing an
+    #    outage as a content problem sends a human to the wrong document.
+    if state.transport_failures >= MAX_TRANSPORT_FAILURES:
+        return (
+            True,
+            f"{TRANSPORT_TRIP_PREFIX}: {state.transport_failures} role call(s) "
+            "for this item returned nothing usable (limit is "
+            f"MAX_TRANSPORT_FAILURES = {MAX_TRANSPORT_FAILURES}). No draft was "
+            "produced and no rule was evaluated, so this says nothing about the "
+            "row — it is a transport or reply-format problem for a human to "
+            "look at",
+        )
+
+    # 1. Attempt budget. First among the content rules because it is the
+    #    unconditional ceiling — no amount of promising-looking movement buys a
+    #    fourth attempt.
     if state.attempts >= MAX_REFINE_ATTEMPTS:
         return (
             True,

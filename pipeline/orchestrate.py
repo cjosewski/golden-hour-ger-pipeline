@@ -21,9 +21,10 @@ from .breaker import (
     RUN_ABORT_ESCALATION_RATIO,
     ItemBreakerState,
     RunBreaker,
+    is_transport_trip,
     should_trip,
 )
-from .evaluator import evaluate
+from .evaluator import evaluate, has_placeholder_label
 from .generator import GenerationError, LiveGenerator, OfflineGenerator, resolve_model
 from .prompts import KB_DIR, load_exemplar_row_names
 from .refiner import LiveRefiner, OfflineRefiner
@@ -101,6 +102,23 @@ class AttemptRecord:
     result: EvaluationResult
 
 
+def _refine_calls(attempts: list[AttemptRecord]) -> int:
+    """How many of these attempts were produced by a Refiner call.
+
+    The Refiner can only run once a draft exists. Every attempt after the first
+    one that carries a draft is a refine; everything before that is the
+    Generator being called again after a failed reply.
+    """
+    count = 0
+    drafted = False
+    for record in attempts:
+        if drafted:
+            count += 1
+        if record.item is not None:
+            drafted = True
+    return count
+
+
 @dataclass
 class ItemOutcome:
     """Everything that happened to one request."""
@@ -120,8 +138,30 @@ class ItemOutcome:
 
     @property
     def refine_attempts(self) -> int:
-        """Drafts after the first — i.e. how many times the refiner ran."""
-        return max(0, len(self.attempts) - 1)
+        """How many times the Refiner role actually ran for this item.
+
+        Not ``len(attempts) - 1``. A role call that failed produced no draft,
+        and the loop responds to that by calling the *Generator* again — there
+        is nothing to refine. Counting those as refine attempts over-reported
+        the refiner's work on exactly the runs where it did none, which is the
+        live path's most likely failure mode rather than a hypothetical one.
+        """
+        return _refine_calls(self.attempts)
+
+    def attempt_label(self, record: AttemptRecord) -> str:
+        """Heading for one attempt, naming the role call that produced it.
+
+        Which role ran is not read off ``record.index``: after a failed
+        generator call the loop calls the generator again, so attempt 2 can be
+        a retry rather than a revision. Labelling it "refiner revision 1" would
+        credit the refiner with a draft it never returned.
+        """
+        if record.index == 0:
+            return "Attempt 1 — initial draft"
+        if any(r.item is not None for r in self.attempts[: record.index]):
+            revision = _refine_calls(self.attempts[: record.index + 1])
+            return f"Attempt {record.index + 1} — refiner revision {revision}"
+        return f"Attempt {record.index + 1} — generator retry {record.index}"
 
 
 def _generation_error_result(exc: GenerationError) -> EvaluationResult:
@@ -193,7 +233,16 @@ def run_item(
                 result=result,
             )
         )
-        state.history.append(result.codes)
+        if role_call_failed:
+            # A failed role call is a fact about the transport, not about the
+            # row: no draft was produced, so no rule was evaluated. It is
+            # counted on its own dial and kept out of `history`, which the
+            # no-progress and regression rules compare — two rate limits in a
+            # row are not "the refiner is returning an equivalent draft", and
+            # reporting them as that sends a human to the wrong problem.
+            state.transport_failures += 1
+        else:
+            state.history.append(result.codes)
 
         if result.passed:
             if current is None:
@@ -212,7 +261,13 @@ def run_item(
             outcome.trip_reason = reason
             return outcome
 
-        state.attempts += 1
+        if not role_call_failed:
+            # The refine budget is spent on corrections, not on outages. A
+            # failed role call produced nothing to correct, so charging the
+            # item for it would escalate a perfectly fixable row because the
+            # network hiccuped. Repeated failures are still bounded — by
+            # MAX_TRANSPORT_FAILURES, on the dial that describes them.
+            state.attempts += 1
 
 
 @dataclass
@@ -222,6 +277,10 @@ class RunResult:
     outcomes: list[ItemOutcome]
     mode: str
     model: str
+    # How many requests this run was asked for. Carried on the result rather
+    # than read back from the module-level REQUESTS tuple, so a run driven with
+    # a different request set reports its own size instead of the default's.
+    requested: int = 0
     aborted: bool = False
     abort_reason: str = ""
     generator_calls: int = 0
@@ -256,7 +315,35 @@ def run_pipeline(*, offline: bool, output_dir: Path) -> RunResult:
         mode = "live"
         model = resolve_model()
 
-    run = RunResult(outcomes=[], mode=mode, model=model)
+    return run_requests(
+        REQUESTS,
+        generator=generator,
+        refiner=refiner,
+        mode=mode,
+        model=model,
+        output_dir=output_dir,
+    )
+
+
+def run_requests(
+    requests: tuple[ArchetypeRequest, ...],
+    *,
+    generator: GeneratorRole,
+    refiner: RefinerRole,
+    mode: str,
+    model: str,
+    output_dir: Path,
+) -> RunResult:
+    """Run one request set through the GER loop and write every output file.
+
+    Split out from `run_pipeline` (which owns choosing the roles) so the run
+    level of the circuit breaker can be driven end to end. With the seven
+    shipped fixtures the worst case is one escalation in seven, well under the
+    abort ratio, so `RunBreaker` would otherwise only ever be exercised in
+    isolation — unit-tested but never proven to actually stop a run. Self-test
+    section 23 calls this with a request set built to escalate a majority.
+    """
+    run = RunResult(outcomes=[], mode=mode, model=model, requested=len(requests))
     run_breaker = RunBreaker()
 
     # Seeded from the live table, not empty. `R4_DUPLICATE_NAME` compares
@@ -273,7 +360,7 @@ def run_pipeline(*, offline: bool, output_dir: Path) -> RunResult:
     # worth of paid model work, and losing all of it because the seventh threw
     # is a needless second failure on top of the first.
     try:
-        for request in REQUESTS:
+        for request in requests:
             outcome = run_item(
                 request, generator=generator, refiner=refiner, seen_names=seen_names
             )
@@ -415,7 +502,15 @@ def write_archetypes_json(run: RunResult, path: Path) -> None:
 
 
 def _vitals_summary(item: GeneratedArchetype) -> str:
-    """The vitals a reader needs to check a SALT verdict by hand."""
+    """The at-a-glance line: what a reader needs to check a SALT verdict by hand.
+
+    A summary line is a *selection*, so it can only ever be read as the whole
+    story by accident. The tourniquet pass window is here because it is the one
+    non-vital an R2 finding routinely turns on, and a line that omitted it
+    rendered a repaired draft identically to the broken one it replaced. For
+    the general case there is `_field_changes`, which reads the models rather
+    than a hand-picked list and cannot go stale the way this line did.
+    """
     row = item.row
     intent = item.triage_intent
     return (
@@ -428,9 +523,140 @@ def _vitals_summary(item: GeneratedArchetype) -> str:
         f"consciousness {_fmt_number(intent.InitialConsciousness01)} "
         f"(altered below {_fmt_number(row.ConsciousnessAlteredThreshold01)}) · "
         f"hemorrhage insult {_fmt_number(row.HemorrhageInsultMagnitude01)} · "
+        f"tourniquet window "
+        f"{_fmt_number(row.TourniquetPassWindowSeconds)}s · "
         f"survivable {intent.bSurvivableWithResources} · "
         f"minor-injuries-only {intent.bMinorInjuriesOnly}"
     )
+
+
+#: Longest string rendered in full in a change line before the differing part
+#: is isolated instead. An authoring note runs well past this; a row name, an
+#: action name and an asset path all sit comfortably under it.
+_FULL_TEXT_LIMIT = 80
+#: Longest changed segment shown before it is clipped.
+_SEGMENT_LIMIT = 110
+
+
+def _clip(text: str, limit: int = _SEGMENT_LIMIT) -> str:
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _render_change_value(value: Any) -> str:
+    """One side of a non-text field change, rendered for a human reader."""
+    if isinstance(value, bool):
+        return str(value)
+    if isinstance(value, float):
+        return _fmt_number(value)
+    return str(value)
+
+
+def _render_text_change(old: str, new: str) -> str:
+    """Render a change between two strings so the *difference* is what shows.
+
+    Truncating both sides of a long value to a fixed width is how the run log
+    came to render two different authoring notes identically — the edit was
+    past the cut. So short values are shown in full, and long ones have their
+    common prefix and suffix elided (`…`) until what is left is the part that
+    actually changed.
+    """
+    old_text = " ".join(old.split())
+    new_text = " ".join(new.split())
+
+    if len(old_text) <= _FULL_TEXT_LIMIT and len(new_text) <= _FULL_TEXT_LIMIT:
+        return f"'{old_text}' → '{new_text}'"
+
+    head = 0
+    while (
+        head < min(len(old_text), len(new_text))
+        and old_text[head] == new_text[head]
+    ):
+        head += 1
+    tail = 0
+    while (
+        tail < min(len(old_text), len(new_text)) - head
+        and old_text[len(old_text) - 1 - tail] == new_text[len(new_text) - 1 - tail]
+    ):
+        tail += 1
+
+    old_middle = old_text[head : len(old_text) - tail]
+    new_middle = new_text[head : len(new_text) - tail]
+    lead = "…" if head else ""
+    trail = "…" if tail else ""
+
+    if not old_middle:
+        return f"gained {lead}'{_clip(new_middle)}'{trail}"
+    if not new_middle:
+        return f"lost {lead}'{_clip(old_middle)}'{trail}"
+    return (
+        f"{lead}'{_clip(old_middle)}'{trail} → {lead}'{_clip(new_middle)}'{trail}"
+    )
+
+
+def _render_change(name: str, old: Any, new: Any) -> str:
+    """One field's change, as it appears in the log's change line."""
+    if isinstance(old, str) and isinstance(new, str):
+        return f"{name} {_render_text_change(old, new)}"
+    return f"{name} {_render_change_value(old)} → {_render_change_value(new)}"
+
+
+def _field_changes(
+    previous: GeneratedArchetype, current: GeneratedArchetype
+) -> list[str]:
+    """Every field that differs between two drafts, oldest value first.
+
+    Computed by **iterating the pydantic models**, not by naming fields here.
+    That is the whole point: the previous version of the run log described each
+    draft with a hand-listed summary line, so an item whose repair touched a
+    column the list did not mention rendered two byte-identical drafts whose
+    verdict flipped from violation to clean — which reads as a
+    non-deterministic evaluator rather than as a working one. A field added to
+    the row or the triage intent is picked up here automatically, so the log
+    cannot go stale the same way again.
+    """
+    changes: list[str] = []
+    before = previous.model_dump(mode="json")
+    after = current.model_dump(mode="json")
+
+    for section, info in GeneratedArchetype.model_fields.items():
+        sub_fields = getattr(info.annotation, "model_fields", None)
+        if sub_fields is None:
+            # Not a nested model — compare the section as one value rather than
+            # silently skipping it.
+            if before[section] != after[section]:
+                changes.append(
+                    _render_change(section, before[section], after[section])
+                )
+            continue
+        for name in sub_fields:
+            old, new = before[section][name], after[section][name]
+            if old != new:
+                changes.append(_render_change(name, old, new))
+    return changes
+
+
+def _change_lines(outcome: ItemOutcome, record: AttemptRecord) -> list[str]:
+    """The "changed since attempt N" line for one attempt, if it has one.
+
+    Compared against the last attempt that actually produced a draft, so a
+    failed role call in between does not make the next revision look like it
+    changed nothing.
+    """
+    if record.item is None:
+        return []
+    previous = next(
+        (
+            earlier
+            for earlier in reversed(outcome.attempts[: record.index])
+            if earlier.item is not None
+        ),
+        None,
+    )
+    if previous is None or previous.item is None:
+        return []
+    changes = _field_changes(previous.item, record.item)
+    rendered = "; ".join(changes) if changes else "(no field changed)"
+    return [f"- **Changed since attempt {previous.index + 1}**: {rendered}"]
 
 
 def _violation_block(result: EvaluationResult) -> list[str]:
@@ -454,7 +680,7 @@ def write_ger_log(run: RunResult, path: Path) -> None:
         f"- **Mode**: {run.mode}",
         f"- **Model**: `{run.model}`",
         f"- **Run at**: {datetime.now(timezone.utc).isoformat(timespec='seconds')}",
-        f"- **Requested**: {len(REQUESTS)} · **Accepted**: {len(run.accepted)} · "
+        f"- **Requested**: {run.requested} · **Accepted**: {len(run.accepted)} · "
         f"**Escalated**: {len(run.escalated)}",
         # Read through the module so a `--max-attempts` override is reported
         # accurately rather than showing the compiled-in default.
@@ -498,16 +724,12 @@ def write_ger_log(run: RunResult, path: Path) -> None:
         ]
 
         for record in outcome.attempts:
-            heading = (
-                "### Attempt 1 — initial draft"
-                if record.index == 0
-                else f"### Attempt {record.index + 1} — refiner revision {record.index}"
-            )
-            lines += [heading, ""]
+            lines += [f"### {outcome.attempt_label(record)}", ""]
 
             if record.item is None:
                 lines += [
-                    "The role call produced no usable item.",
+                    "The role call produced no usable item, so there is no draft "
+                    "to show and no rule was evaluated against one.",
                     "",
                 ]
             else:
@@ -523,8 +745,9 @@ def write_ger_log(run: RunResult, path: Path) -> None:
                     f"- **Derived from these vitals**: {derived}",
                     f"- **Vitals**: {_vitals_summary(record.item)}",
                     f"- **Authoring note**: {record.item.triage_intent.AuthoringNote}",
-                    "",
                 ]
+                lines += _change_lines(outcome, record)
+                lines += [""]
 
             lines += ["**Evaluator findings:**", ""]
             lines += _violation_block(record.result)
@@ -602,6 +825,32 @@ def _mismatch_axis(outcome: ItemOutcome) -> tuple[str, list[str]]:
 
 def _escalation_guidance(outcome: ItemOutcome) -> list[str]:
     """Point the human at the section that can actually settle the deadlock."""
+    if is_transport_trip(outcome.trip_reason):
+        # Nothing below applies: no draft survived, so there is no row to
+        # reason about and no GDD section to consult. Saying so plainly is the
+        # whole fix — the previous version would have printed a paragraph about
+        # the refiner refusing to reconcile a finding that was never raised.
+        return [
+            "## What happened",
+            "",
+            "The role calls for this item failed to return anything usable, so "
+            "no draft was ever evaluated. **This is not a finding about the "
+            "row.** No rule was checked against it, and nothing in the "
+            "knowledge base is implicated.",
+            "",
+            "The attempt history above records the error text each call "
+            "returned. Typical causes are a rate limit, an expired or "
+            "unauthorized API key, a network interruption, or a model reply "
+            "that was not the JSON object the roles are required to return.",
+            "",
+            "**To resolve**: check the error text, then re-run. The item is "
+            "escalated rather than accepted because a row nobody evaluated is "
+            "exactly the row this pipeline exists to keep out of the "
+            "DataTable — an unchecked row that imports cleanly is the failure "
+            "mode, not the safe fallback.",
+            "",
+        ]
+
     codes: set[str] = set()
     for record in outcome.attempts:
         codes |= record.result.codes
@@ -744,14 +993,13 @@ def write_escalation(outcome: ItemOutcome, path: Path) -> None:
     ]
 
     for record in outcome.attempts:
-        label = (
-            "Attempt 1 — initial draft"
-            if record.index == 0
-            else f"Attempt {record.index + 1} — refiner revision {record.index}"
-        )
-        lines += [f"### {label}", ""]
+        lines += [f"### {outcome.attempt_label(record)}", ""]
         if record.item is None:
-            lines += ["The role call produced no usable item.", ""]
+            lines += [
+                "The role call produced no usable item, so there is no draft to "
+                "show and no rule was evaluated against one.",
+                "",
+            ]
         else:
             derived = (
                 record.result.derived_category.value
@@ -763,8 +1011,9 @@ def write_escalation(outcome: ItemOutcome, path: Path) -> None:
                 f"· **Derived**: {derived}",
                 f"- **Vitals**: {_vitals_summary(record.item)}",
                 f"- **Authoring note**: {record.item.triage_intent.AuthoringNote}",
-                "",
             ]
+            lines += _change_lines(outcome, record)
+            lines += [""]
         lines += _violation_block(record.result)
         lines += [""]
 
@@ -778,7 +1027,7 @@ def write_run_summary(run: RunResult, path: Path) -> None:
     summary = {
         "mode": run.mode,
         "model": run.model,
-        "requested": len(REQUESTS),
+        "requested": run.requested,
         "processed": len(run.outcomes),
         "accepted": len(run.accepted),
         "escalated": len(run.escalated),
@@ -800,6 +1049,158 @@ def write_run_summary(run: RunResult, path: Path) -> None:
     write_text_file(path, json.dumps(summary, indent=2, ensure_ascii=False) + "\n")
 
 
+def _label_status(note: str) -> str:
+    """How a row's authoring note stands against R3, in a table cell."""
+    return "present" if has_placeholder_label(note) else "**MISSING**"
+
+
+def write_generated_notes(run: RunResult, path: Path) -> None:
+    """The CSV's sibling notes file: provenance the CSV itself cannot carry.
+
+    This exists because of a coherence gap in the pipeline's own output. R3
+    enforces the "clinically plausible placeholder — SME validation pending"
+    label on `AuthoringNote` — but `AuthoringNote` is not one of the 24
+    DataTable columns, so the label never reaches the file that gets imported.
+    Searching the generated CSV for the word "placeholder" returned nothing:
+    the artifact carrying invented clinical vitals into the game shipped with
+    no provenance on it at all, while the rule protecting it lived only in the
+    run log.
+
+    The project's own rule prescribes exactly this fix.
+    `knowledge_base/data-files.md` § Carve-out: "Unreal's CSV importer has no
+    comment syntax — the first row is always literal headers. Put per-value
+    sourcing/placeholder documentation in a sibling `<Name>.notes.md`, never
+    inline." The game repo's hand-authored table already ships one; the
+    generated table now does too.
+    """
+    generated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    lines: list[str] = [
+        "# `DT_CasualtyArchetypes.generated` — CSV Source Notes",
+        "",
+        "> **Sibling file**: `DT_CasualtyArchetypes.generated.csv` — "
+        f"{len(run.accepted)} accepted row(s)",
+        f"> **Produced by**: this repo's GER pipeline, {run.mode} mode, model "
+        f"`{run.model}`",
+        f"> **Run at**: {generated_at}",
+        "> **Schema authority**: `knowledge_base/casualty-archetype-schema.md` "
+        "(`F_CasualtyArchetypeRow`, 23 authored fields in Groups 1–7; the "
+        "DataTable adds the engine's own `Name` key column, which is why the "
+        "CSV has 24)",
+        "> **Rule enforced on every row below**: "
+        "`knowledge_base/triage-system.md` § Formulas — Ground-Truth Category "
+        "Derivation",
+        "",
+        "Why this is a sibling file rather than a comment block inside the CSV: "
+        "`knowledge_base/data-files.md` § Carve-out states that \"Unreal's CSV "
+        "importer has no comment syntax — the first row is always literal "
+        "headers\", and instructs authors to \"put per-value "
+        "sourcing/placeholder documentation in a sibling `<Name>.notes.md`, "
+        "never inline\". The hand-authored table in the game repo ships one of "
+        "these; the generated table now does too.",
+        "",
+        "There is a second reason specific to this pipeline. Rule R3 requires "
+        "every generated row to carry the \"clinically plausible placeholder — "
+        "SME validation pending\" label on its `AuthoringNote` — and "
+        "`AuthoringNote` is **not one of the 24 CSV columns**. Neither is the "
+        "declared SALT category, deliberately: `triage-system.md` § Summary "
+        "keeps the ground-truth category \"derived live from their Pulse "
+        "physiology state — not a static, author-placed tag\". Both live here "
+        "instead, next to the file they describe.",
+        "",
+        "## Placeholder-labelling status of every generated row",
+        "",
+        "Every clinical value in the sibling CSV — every vital sign, every "
+        "threshold band — was invented by a generator role. **No clinician has "
+        "reviewed any of them.** They are clinically plausible placeholders "
+        "with SME validation pending, and they must be treated as such until "
+        "an acting clinical SME reviews them.",
+        "",
+        "| Row | Declared | Derived from the row's own vitals | Refines | "
+        "Placeholder label |",
+        "|---|---|---|---|---|",
+    ]
+
+    for outcome in run.accepted:
+        item = _accepted_item(outcome)
+        final = outcome.attempts[-1].result
+        derived = (
+            final.derived_category.value if final.derived_category else "not derived"
+        )
+        lines.append(
+            f"| `{item.row.Name}` | {item.triage_intent.DeclaredCategory.value} | "
+            f"{derived} | {outcome.refine_attempts} | "
+            f"{_label_status(item.triage_intent.AuthoringNote)} |"
+        )
+
+    if not run.accepted:
+        lines.append("| *(no rows were accepted in this run)* | — | — | — | — |")
+
+    lines += [
+        "",
+        "Declared and derived agree on every shipped row — that agreement is "
+        "what R1 checks, and a row where they disagree is not written to the "
+        "CSV.",
+        "",
+        "## Per-row authoring notes, verbatim",
+        "",
+    ]
+
+    for outcome in run.accepted:
+        item = _accepted_item(outcome)
+        accepted_how = (
+            "accepted on the first draft"
+            if outcome.refine_attempts == 0
+            else f"accepted after {outcome.refine_attempts} refine attempt(s)"
+        )
+        lines += [
+            f"### `{item.row.Name}`",
+            "",
+            f"- **Request**: `{outcome.request.key}` (asked for "
+            f"{outcome.request.intended_category.value}) — {accepted_how}",
+            f"- **Authoring note**: {item.triage_intent.AuthoringNote}",
+            f"- **Placeholder label**: "
+            f"{_label_status(item.triage_intent.AuthoringNote)}",
+            f"- **Pulse patient file**: `{item.row.PulsePatientFileName}` · "
+            f"**vitals override gate**: {item.row.bApplyInitialVitalsOverride}",
+            f"- **Vitals as authored**: {_vitals_summary(item)}",
+            "",
+        ]
+
+    lines += [
+        "## Rows this run refused to ship",
+        "",
+    ]
+    if run.escalated:
+        lines += [
+            "These items were escalated to a human and are deliberately **not** "
+            "in the CSV. A row the pipeline knows is incoherent is worse than a "
+            "missing row: it imports cleanly, looks plausible, and silently "
+            "supplies the wrong ground truth to scoring.",
+            "",
+        ]
+        for outcome in run.escalated:
+            item = outcome.final_item
+            row_name = f"`{item.row.Name}`" if item is not None else "*(no draft)*"
+            lines += [
+                f"- {row_name} — request `{outcome.request.key}`, asked for "
+                f"{outcome.request.intended_category.value}. **Held back "
+                f"because**: {outcome.trip_reason}. See "
+                f"`escalations/{outcome.request.key}.md`.",
+            ]
+        lines.append("")
+    else:
+        lines += ["No item escalated in this run.", ""]
+
+    if run.aborted:
+        lines += [
+            f"**The run was aborted by the circuit breaker**: {run.abort_reason}. "
+            "Requests after that point were never attempted.",
+            "",
+        ]
+
+    write_text_file(path, "\n".join(lines))
+
+
 def write_outputs(run: RunResult, *, output_dir: Path) -> None:
     """Write every artifact listed in the README's output table."""
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -816,6 +1217,9 @@ def write_outputs(run: RunResult, *, output_dir: Path) -> None:
     ]
 
     write_generated_csv(accepted_rows, output_dir / "DT_CasualtyArchetypes.generated.csv")
+    write_generated_notes(
+        run, output_dir / "DT_CasualtyArchetypes.generated.notes.md"
+    )
     write_archetypes_json(run, output_dir / "archetypes.json")
     write_ger_log(run, output_dir / "ger_log.md")
     for outcome in run.escalated:

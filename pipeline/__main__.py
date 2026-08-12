@@ -56,6 +56,18 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def apply_max_attempts_override(value: int) -> None:
+    """Point the circuit breaker's per-item budget at ``value``.
+
+    Rebound on the module rather than passed down a call chain because
+    `should_trip` reads the module-level constant at call time — that is what
+    makes the override reach the breaker at all. A function rather than two
+    lines inside `main` so the self-test can prove the flag actually lands on
+    the policy dial instead of asserting that `argparse` parses an integer.
+    """
+    breaker.MAX_REFINE_ATTEMPTS = value
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
@@ -76,9 +88,7 @@ def main(argv: list[str] | None = None) -> int:
                 file=sys.stderr,
             )
             return 2
-        # Rebound on the module so `should_trip` — which reads the module-level
-        # constant at call time — picks the override up.
-        breaker.MAX_REFINE_ATTEMPTS = args.max_attempts
+        apply_max_attempts_override(args.max_attempts)
 
     mode = "offline (deterministic fixtures)" if args.offline else "live (Anthropic)"
     print(f"Golden Hour GER pipeline — {mode}")

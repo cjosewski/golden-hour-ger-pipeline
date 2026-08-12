@@ -498,8 +498,9 @@ def _offline_draft(request: ArchetypeRequest) -> GeneratedArchetype:
                 bMinorInjuriesOnly=False,
                 bSurvivableWithResources=True,
                 AuthoringNote=(
-                    "Apneic after one airway-reposition attempt. Vitals are a "
-                    f"{PLACEHOLDER_LABEL} representing arrest at spawn."
+                    "Apneic after one airway-reposition attempt; the row "
+                    "represents arrest at spawn. Vitals are a "
+                    f"{PLACEHOLDER_LABEL}."
                 ),
             ),
         )

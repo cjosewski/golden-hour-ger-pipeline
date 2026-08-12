@@ -72,10 +72,30 @@ FREE_TEXT_COLUMNS: tuple[str, ...] = (
 
 # `casualty-archetype-schema.md` § "Placeholder-labeled clinical values and
 # their sources": every value listed there "must carry the 'clinically plausible
-# placeholder — SME validation pending' label wherever surfaced". Matching on
-# the word "placeholder" alone keeps the check robust to wording drift while
-# still failing a note that never mentions provenance at all.
-PLACEHOLDER_TOKEN = "placeholder"
+# placeholder — SME validation pending' label wherever surfaced".
+#
+# Matched as two required tokens rather than as the literal label. Requiring the
+# exact string would fail an otherwise-correct note over an em dash an editor
+# normalised to a hyphen, or over a line break inserted between the two halves —
+# typography, not provenance. Matching the single word "placeholder" (what this
+# rule did before) was too loose in the other direction: it passed any note that
+# used the word while never saying review was pending, which is the half of the
+# label that carries the actual disclosure. Requiring both halves, case- and
+# whitespace-insensitive, fails a note missing either one and survives
+# punctuation drift.
+PLACEHOLDER_TOKENS: tuple[str, ...] = ("placeholder", "sme validation pending")
+
+
+def has_placeholder_label(note: str) -> bool:
+    """True when an authoring note carries both halves of the required label.
+
+    Public because the generated CSV's sibling notes file reports each row's
+    labelling status, and it must report exactly what R3 enforces rather than
+    a second opinion that could drift from it.
+    """
+    normalized = " ".join(note.split()).casefold()
+    return all(token in normalized for token in PLACEHOLDER_TOKENS)
+
 
 # Used as `gdd_source` by the handful of R2 rules that no `knowledge_base/`
 # document publishes. `casualty-archetype-schema.md` § Group 1 defines the five
@@ -539,7 +559,9 @@ def evaluate(item: GeneratedArchetype, *, seen_names: set[str]) -> EvaluationRes
     # ------------------------------------------------------------------
     # R3 — placeholder labelling.
     # ------------------------------------------------------------------
-    if PLACEHOLDER_TOKEN not in intent.AuthoringNote.casefold():
+    if not has_placeholder_label(intent.AuthoringNote):
+        normalized_note = " ".join(intent.AuthoringNote.split()).casefold()
+        missing = [token for token in PLACEHOLDER_TOKENS if token not in normalized_note]
         violations.append(
             Violation(
                 code="R3_MISSING_PLACEHOLDER_LABEL",
@@ -554,11 +576,13 @@ def evaluate(item: GeneratedArchetype, *, seen_names: set[str]) -> EvaluationRes
                     "values and their sources"
                 ),
                 detail=(
-                    "AuthoringNote does not mention 'placeholder'. Every vital sign "
-                    "and threshold on a generated row is invented rather than "
-                    "SME-authored, so the row must say so or a reader will mistake "
-                    f"it for validated clinical data. AuthoringNote was: "
-                    f"{intent.AuthoringNote!r}"
+                    "AuthoringNote is missing "
+                    + " and ".join(repr(token) for token in missing)
+                    + ". Every vital sign and threshold on a generated row is "
+                    "invented rather than SME-authored, so the row must say both "
+                    "that the values are placeholders and that clinical review is "
+                    "still pending, or a reader will mistake them for validated "
+                    f"clinical data. AuthoringNote was: {intent.AuthoringNote!r}"
                 ),
             )
         )

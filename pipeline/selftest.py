@@ -1,8 +1,9 @@
 """Offline self-test. No API key, no network.
 
-Sixteen numbered sections covering the SALT derivation, the evaluator's rule
-families, the circuit breaker, the knowledge-base loaders, the CSV contract and
-the GER loop's recovery from a failed role call. Run with:
+Twenty-three numbered sections covering the SALT derivation, the evaluator's
+rule families, the circuit breaker at both levels, the knowledge-base loaders,
+the CSV contract, the run log's rendering, and the GER loop's recovery from a
+failed role call. Run with:
 
     uv run python -m pipeline --selftest
 
@@ -17,23 +18,51 @@ tightening the consciousness comparison off its boundary — both survived the
 whole suite. Every derivation in the graded rule needs at least one case where
 it is the *only* thing that can decide the answer; otherwise the suite is
 testing the fixtures, not the rule.
+
+Sections 17 to 23 come from a review that found the untested paths were the
+load-bearing ones: what the run log actually renders (17), a transport failure
+being reported as a content problem (18), the one breaker rule with no coverage
+and the CLI budget override (19), the JSON extractor the live path depends on
+(20), the CSV cell renderer (21), and the two end-to-end guarantees the whole
+submission rests on — an escalated row never reaches the CSV (22), and the
+run-level breaker actually stops a bad run (23).
 """
 
 from __future__ import annotations
 
+import contextlib
 import csv
+import io
+import tempfile
 from pathlib import Path
 
+from . import breaker as breaker_policy
 from .breaker import (
     MAX_REFINE_ATTEMPTS,
+    MAX_TRANSPORT_FAILURES,
     RUN_ABORT_ESCALATION_RATIO,
     ItemBreakerState,
     RunBreaker,
+    is_transport_trip,
     should_trip,
 )
 from .evaluator import _derived_sentence, evaluate, redact_derived_category
-from .generator import GenerationError, PLACEHOLDER_LABEL, exemplar_shaped_row
-from .orchestrate import run_item
+from .generator import (
+    GenerationError,
+    PLACEHOLDER_LABEL,
+    exemplar_shaped_row,
+    extract_json_object,
+)
+from .orchestrate import (
+    AttemptRecord,
+    ItemOutcome,
+    RunResult,
+    _csv_cell,
+    run_item,
+    run_requests,
+    write_escalation,
+    write_ger_log,
+)
 from .prompts import (
     build_refiner_prompt,
     load_exemplar_csv_text,
@@ -43,6 +72,8 @@ from .prompts import (
 from .requests import ArchetypeRequest
 from .schema import (
     CSV_COLUMNS,
+    ArchetypeRow,
+    EvaluationResult,
     GeneratedArchetype,
     SaltCategory,
     TriageIntent,
@@ -50,9 +81,8 @@ from .schema import (
 )
 from .salt import derive_salt_category
 
-EXEMPLAR_CSV = Path(__file__).resolve().parent.parent / (
-    "knowledge_base/DT_CasualtyArchetypes.exemplar.csv"
-)
+REPO_ROOT = Path(__file__).resolve().parent.parent
+EXEMPLAR_CSV = REPO_ROOT / "knowledge_base/DT_CasualtyArchetypes.exemplar.csv"
 
 # A fully-true SALT input set, used as the base for the truth-table cases so
 # each one varies exactly the input it is testing.
@@ -95,6 +125,128 @@ def _intent(**overrides: object) -> TriageIntent:
     }
     values.update(overrides)
     return TriageIntent(**values)  # type: ignore[arg-type]
+
+
+def _raises_generation_error(call: object) -> bool:
+    """True when calling ``call`` raises `GenerationError`.
+
+    A malformed reply must become a retryable finding rather than a crash, so
+    "it raised the right exception type" is the assertion, not "it raised".
+    """
+    try:
+        call()  # type: ignore[operator]
+    except GenerationError:
+        return True
+    except Exception:  # noqa: BLE001 — any other exception is the failure
+        return False
+    return False
+
+
+def _fixture_request(key: str, category: SaltCategory) -> ArchetypeRequest:
+    """A request that exists only to drive the loop; never sent to a model."""
+    return ArchetypeRequest(
+        key=key,
+        intended_category=category,
+        brief="Self-test fixture request; never sent to a model.",
+    )
+
+
+# Sections 22 and 23 drive the real `run_requests` with these. Kept out of the
+# shipped `REQUESTS` tuple deliberately: the offline demo is evidence about the
+# rules, and padding it with items designed to fail would make its counts mean
+# something else.
+_CLEAN_REQUEST = _fixture_request("selftest_clean", SaltCategory.RED)
+_UNFIXABLE_REQUEST = _fixture_request("selftest_unfixable", SaltCategory.GRAY)
+_ABORT_REQUESTS: tuple[ArchetypeRequest, ...] = tuple(
+    _fixture_request(f"selftest_abort_{index}", SaltCategory.RED)
+    for index in (1, 2, 3)
+)
+
+
+def _clean_item(name: str) -> GeneratedArchetype:
+    """An exemplar-shaped row with a coherent Red declaration: passes cleanly."""
+    return GeneratedArchetype(
+        row=exemplar_shaped_row(Name=name),
+        triage_intent=_intent(DeclaredCategory=SaltCategory.RED),
+    )
+
+
+class _ScriptedGenerator:
+    """Deterministic generator for the two end-to-end sections."""
+
+    def __init__(self) -> None:
+        self.model = "selftest-fixture"
+        self.calls = 0
+
+    def generate(self, request: ArchetypeRequest) -> GeneratedArchetype:
+        self.calls += 1
+        if request.key == _CLEAN_REQUEST.key:
+            return _clean_item("Casualty_Selftest_Clean")
+        if request.key == _UNFIXABLE_REQUEST.key:
+            # Declared Gray while authoring survivable = true, which derives
+            # Red. Only the request brief could settle which is right, and the
+            # refiner never receives it — the same construction as the shipped
+            # escalation item.
+            return GeneratedArchetype(
+                row=exemplar_shaped_row(Name="Casualty_Selftest_Unfixable"),
+                triage_intent=_intent(
+                    DeclaredCategory=SaltCategory.GRAY,
+                    bSurvivableWithResources=True,
+                ),
+            )
+        # The abort set: one band violation each, nothing else.
+        index = request.key.rsplit("_", 1)[-1]
+        return GeneratedArchetype(
+            row=exemplar_shaped_row(
+                Name=f"Casualty_Selftest_Abort_{index}",
+                TourniquetPassWindowSeconds=240.0,
+            ),
+            triage_intent=_intent(DeclaredCategory=SaltCategory.RED),
+        )
+
+
+class _EchoRefiner:
+    """Returns the draft unchanged — the no-progress condition, exactly."""
+
+    def __init__(self) -> None:
+        self.model = "selftest-fixture"
+        self.calls = 0
+
+    def refine(
+        self, item: GeneratedArchetype, violations: list[Violation]
+    ) -> GeneratedArchetype:
+        self.calls += 1
+        return item
+
+
+class _ShufflingRefiner:
+    """Trades one violation for a different one, forever.
+
+    Neither the no-progress rule (identical code sets) nor the regression rule
+    (more violations than before) can fire against this, so the only policy
+    left to stop it is the attempt budget — which is what section 23 needs, so
+    that the run-level abort it drives is provably caused by the budget
+    override rather than by whichever rule happened to fire first.
+    """
+
+    def __init__(self) -> None:
+        self.model = "selftest-fixture"
+        self.calls = 0
+
+    def refine(
+        self, item: GeneratedArchetype, violations: list[Violation]
+    ) -> GeneratedArchetype:
+        self.calls += 1
+        broke_the_band = any(
+            v.code == "R2_TOURNIQUET_WINDOW_BAND" for v in violations
+        )
+        row: ArchetypeRow = item.row.model_copy(
+            update={
+                "TourniquetPassWindowSeconds": 120.0 if broke_the_band else 240.0,
+                "RespirationRateDistressThresholdBpm": 40.0 if broke_the_band else 30.0,
+            }
+        )
+        return GeneratedArchetype(row=row, triage_intent=item.triage_intent)
 
 
 def run_selftest() -> int:
@@ -388,11 +540,54 @@ def run_selftest() -> int:
     )
     unlabelled_result = evaluate(unlabelled, seen_names=set())
     r.check(
-        "7 unlabelled authoring note raises R3_MISSING_PLACEHOLDER_LABEL",
+        "7a unlabelled authoring note raises R3_MISSING_PLACEHOLDER_LABEL",
         "R3_MISSING_PLACEHOLDER_LABEL" in unlabelled_result.codes,
         "casualty-archetype-schema.md requires the 'clinically plausible "
         "placeholder - SME validation pending' label wherever an invented "
         f"clinical value is surfaced. Codes raised: {sorted(unlabelled_result.codes)}",
+    )
+
+    # Half a label is not a label. This rule used to match the bare word
+    # "placeholder", which passed a note that used the word while never saying
+    # review was pending — and "review is still pending" is the half that
+    # carries the disclosure a reader acts on.
+    half_labelled = GeneratedArchetype(
+        row=exemplar_shaped_row(Name="Casualty_Half_Label"),
+        triage_intent=_intent(
+            DeclaredCategory=SaltCategory.RED,
+            AuthoringNote="Femoral bleed casualty. Vitals are placeholder numbers.",
+        ),
+    )
+    r.check(
+        "7b a note saying 'placeholder' but not 'SME validation pending' still fails",
+        "R3_MISSING_PLACEHOLDER_LABEL"
+        in evaluate(half_labelled, seen_names=set()).codes,
+        "The required label is 'clinically plausible placeholder — SME "
+        "validation pending'. A note that calls the numbers placeholders "
+        "without saying clinical review is outstanding does not disclose the "
+        "thing the label exists to disclose.",
+    )
+
+    # ...and punctuation drift is not a labelling failure. The label contains an
+    # em dash; an editor that normalises it, or a line break landing inside the
+    # phrase, must not fail an honestly-labelled row.
+    dash_variant = GeneratedArchetype(
+        row=exemplar_shaped_row(Name="Casualty_Dash_Variant"),
+        triage_intent=_intent(
+            DeclaredCategory=SaltCategory.RED,
+            AuthoringNote=(
+                "Femoral bleed casualty. Vitals are a clinically plausible\n"
+                "placeholder - SME  validation   pending."
+            ),
+        ),
+    )
+    r.check(
+        "7c a hyphen, a line break and stray spaces do not fail an honest label",
+        "R3_MISSING_PLACEHOLDER_LABEL"
+        not in evaluate(dash_variant, seen_names=set()).codes,
+        "R3 checks provenance, not typography. Matching the literal label "
+        "string would fail a correctly-labelled row over an em dash an editor "
+        "rewrote.",
     )
 
     # ------------------------------------------------------------------
@@ -704,7 +899,7 @@ def run_selftest() -> int:
     with EXEMPLAR_CSV.open("r", encoding="utf-8", newline="") as handle:
         exemplar_header = tuple(next(csv.reader(handle)))
     r.check(
-        "15 CSV_COLUMNS equals the exemplar CSV header exactly",
+        "15a CSV_COLUMNS equals the exemplar CSV header exactly",
         CSV_COLUMNS == exemplar_header,
         "The generated CSV must carry the exact column names of the real "
         "DT_CasualtyArchetypes source, or Unreal's DataTable importer silently "
@@ -712,6 +907,35 @@ def run_selftest() -> int:
         f"Model gives {len(CSV_COLUMNS)} columns, exemplar has "
         f"{len(exemplar_header)}. First difference: "
         f"{next((f'{a!r} != {b!r}' for a, b in zip(CSV_COLUMNS, exemplar_header) if a != b), 'none')}",
+    )
+
+    # The README claims its embedded diagram is identical to the standalone
+    # `architecture.mmd`. Two copies of anything drift; this is the check that
+    # keeps the claim true, rather than a promise to remember.
+    diagram_source = (REPO_ROOT / "architecture.mmd").read_text(encoding="utf-8")
+    readme_text = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    embedded = readme_text.split("```mermaid\n")
+    embedded_diagram = (
+        embedded[1].split("```")[0] if len(embedded) > 1 else "(no mermaid block)"
+    )
+    r.check(
+        "15b the README's embedded diagram matches architecture.mmd exactly",
+        embedded_diagram.strip() == diagram_source.strip(),
+        "The README says the same diagram source is committed standalone. "
+        "First differing line: "
+        + str(
+            next(
+                (
+                    f"{a!r} != {b!r}"
+                    for a, b in zip(
+                        embedded_diagram.strip().splitlines(),
+                        diagram_source.strip().splitlines(),
+                    )
+                    if a != b
+                ),
+                "none (lengths may differ)",
+            )
+        ),
     )
 
     # ------------------------------------------------------------------
@@ -805,6 +1029,488 @@ def run_selftest() -> int:
         "One transport failure inside the attempt budget must not cost the "
         f"item. Accepted={retry_outcome.accepted}, "
         f"escalated={retry_outcome.escalated}.",
+    )
+    r.check(
+        "16e the failed call is not counted as a refine attempt",
+        retry_outcome.refine_attempts == 1,
+        "Three attempts were recorded but the refiner ran once — the first "
+        "attempt failed before producing a draft, and the loop answered that "
+        "by calling the generator again. Counting drafts minus one reported "
+        f"the refiner doing work it never did. Got "
+        f"{retry_outcome.refine_attempts}.",
+    )
+    r.check(
+        "16f the retried attempt is labelled a generator retry, not a revision",
+        retry_outcome.attempt_label(retry_outcome.attempts[1])
+        == "Attempt 2 — generator retry 1",
+        "Attempt 2 here was the generator being called again, because attempt "
+        "1 produced no draft. Labelling it 'refiner revision 1' in the run log "
+        "credits the refiner with a draft it never returned. Got "
+        f"{retry_outcome.attempt_label(retry_outcome.attempts[1])!r}.",
+    )
+
+    # ------------------------------------------------------------------
+    print("")
+    print("[17] The run log shows what each refine actually changed")
+    # ------------------------------------------------------------------
+    # The defect this guards: every draft was described by a hand-listed
+    # summary line, so an item repaired in a column that line did not print
+    # rendered two byte-identical drafts whose verdict flipped from violation
+    # to clean. Read as evidence, that says the evaluator is
+    # non-deterministic — an attack on the exact claim the log exists to prove.
+    # The change line is computed by iterating the models, so a new field is
+    # covered without anyone remembering to add it here.
+    log_request = ArchetypeRequest(
+        key="selftest_log_render",
+        intended_category=SaltCategory.RED,
+        brief="Self-test fixture request; never sent to a model.",
+    )
+    band_draft = GeneratedArchetype(
+        row=exemplar_shaped_row(
+            Name="Casualty_Log_Render", TourniquetPassWindowSeconds=240.0
+        ),
+        triage_intent=_intent(DeclaredCategory=SaltCategory.RED),
+    )
+    fixed_draft = GeneratedArchetype(
+        row=band_draft.row.model_copy(
+            update={"TourniquetPassWindowSeconds": 120.0}
+        ),
+        triage_intent=band_draft.triage_intent,
+    )
+    log_outcome = ItemOutcome(
+        request=log_request,
+        attempts=[
+            AttemptRecord(
+                index=0, item=band_draft, result=evaluate(band_draft, seen_names=set())
+            ),
+            AttemptRecord(
+                index=1, item=fixed_draft, result=evaluate(fixed_draft, seen_names=set())
+            ),
+        ],
+        accepted=True,
+    )
+    log_run = RunResult(
+        outcomes=[log_outcome],
+        mode="selftest",
+        model="selftest-fixture",
+        requested=1,
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        log_path = Path(tmp) / "ger_log.md"
+        write_ger_log(log_run, log_path)
+        log_text = log_path.read_text(encoding="utf-8")
+
+    attempt_blocks = log_text.split("### Attempt")
+    # Everything the log says about the draft itself, before the verdict on it.
+    draft_renders = [
+        block.split("**Evaluator findings:**")[0] for block in attempt_blocks[1:3]
+    ]
+    r.check(
+        "17a the two attempts do not render identically",
+        len(draft_renders) == 2 and draft_renders[0] != draft_renders[1],
+        "The only difference between these two drafts is "
+        "TourniquetPassWindowSeconds, which is not a vital. If the log renders "
+        "them identically, a reader sees an unchanged draft whose verdict "
+        "flipped and concludes the evaluator is not deterministic.",
+    )
+    r.check(
+        "17b the change line names the field and both values",
+        "**Changed since attempt 1**: TourniquetPassWindowSeconds 240 → 120"
+        in log_text,
+        "The change line is the explicit answer to 'what did the refiner "
+        "actually do'. Rendered log:\n"
+        + "\n".join(line for line in log_text.splitlines() if "Changed" in line),
+    )
+    identical_run = RunResult(
+        outcomes=[
+            ItemOutcome(
+                request=log_request,
+                attempts=[
+                    AttemptRecord(
+                        index=index,
+                        item=band_draft,
+                        result=evaluate(band_draft, seen_names=set()),
+                    )
+                    for index in (0, 1)
+                ],
+                escalated=True,
+                trip_reason=(
+                    "no progress: the same rule broke on two consecutive attempts"
+                ),
+            )
+        ],
+        mode="selftest",
+        model="selftest-fixture",
+        requested=1,
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        identical_path = Path(tmp) / "ger_log.md"
+        write_ger_log(identical_run, identical_path)
+        identical_text = identical_path.read_text(encoding="utf-8")
+    r.check(
+        "17c a draft that changed nothing says so, rather than saying nothing",
+        "**Changed since attempt 1**: (no field changed)" in identical_text,
+        "An identical re-submission is exactly the condition the breaker's "
+        "no-progress rule exists to catch, so the log states it outright "
+        "instead of leaving a reader to compare two blocks by eye. Change "
+        "lines rendered: "
+        + str([line for line in identical_text.splitlines() if "Changed" in line]),
+    )
+
+    # ------------------------------------------------------------------
+    print("")
+    print("[18] A failed role call is not reported as a content problem")
+    # ------------------------------------------------------------------
+    transport_state = ItemBreakerState(
+        key="transport", transport_failures=MAX_TRANSPORT_FAILURES
+    )
+    transport_trip, transport_reason = should_trip(transport_state)
+    r.check(
+        "18a repeated transport failures trip on their own dial",
+        transport_trip and is_transport_trip(transport_reason),
+        f"MAX_TRANSPORT_FAILURES is {MAX_TRANSPORT_FAILURES}; an item that has "
+        "hit it must escalate. Got trip="
+        f"{transport_trip}, reason={transport_reason!r}",
+    )
+    r.check(
+        "18b the transport reason never diagnoses the refiner",
+        "no progress" not in transport_reason
+        and "equivalent draft" not in transport_reason,
+        "Two rate limits used to enter the violation history as identical "
+        "synthetic verdicts and trip the no-progress rule, which reports 'the "
+        "refiner is returning an equivalent draft rather than reconciling the "
+        "finding' — a confident diagnosis of a draft that was never produced. "
+        f"Reason: {transport_reason!r}",
+    )
+
+    class _AlwaysFailsGenerator:
+        """Every call fails, as a rate-limited or unreachable API would."""
+
+        def __init__(self) -> None:
+            self.model = "selftest-fixture"
+            self.calls = 0
+
+        def generate(self, request: ArchetypeRequest) -> GeneratedArchetype:
+            self.calls += 1
+            raise GenerationError("simulated rate limit (429)")
+
+    class _UnusedRefiner:
+        def __init__(self) -> None:
+            self.model = "selftest-fixture"
+            self.calls = 0
+
+        def refine(
+            self, item: GeneratedArchetype, violations: list[Violation]
+        ) -> GeneratedArchetype:
+            self.calls += 1
+            return item
+
+    transport_request = ArchetypeRequest(
+        key="selftest_transport",
+        intended_category=SaltCategory.RED,
+        brief="Self-test fixture request; never sent to a model.",
+    )
+    transport_refiner = _UnusedRefiner()
+    transport_outcome = run_item(
+        transport_request,
+        generator=_AlwaysFailsGenerator(),
+        refiner=transport_refiner,
+        seen_names=set(),
+    )
+    r.check(
+        "18c an item whose role calls all fail escalates as a transport failure",
+        transport_outcome.escalated
+        and is_transport_trip(transport_outcome.trip_reason)
+        and all(record.item is None for record in transport_outcome.attempts),
+        "Fail-closed: a row nobody evaluated must not be accepted. Got "
+        f"escalated={transport_outcome.escalated}, reason="
+        f"{transport_outcome.trip_reason!r}",
+    )
+    r.check(
+        "18d the refiner is never called when no draft exists",
+        transport_refiner.calls == 0,
+        "There is nothing to refine until a draft parses. Refiner calls: "
+        f"{transport_refiner.calls}.",
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        transport_report_path = Path(tmp) / "transport.md"
+        write_escalation(transport_outcome, transport_report_path)
+        transport_report = transport_report_path.read_text(encoding="utf-8")
+    r.check(
+        "18e the escalation report says plainly that the row was never judged",
+        "This is not a finding about the row" in transport_report
+        and "equivalent draft" not in transport_report,
+        "The escalation report is what a human reads days later. Sending them "
+        "to a GDD section over a network error wastes the one thing "
+        "escalation buys.",
+    )
+
+    # ------------------------------------------------------------------
+    print("")
+    print("[19] Breaker regression rule and the --max-attempts override")
+    # ------------------------------------------------------------------
+    regressed = ItemBreakerState(
+        key="regressed",
+        attempts=1,
+        history=[
+            frozenset({"R1_SALT_MISMATCH"}),
+            frozenset({"R1_SALT_MISMATCH", "R2_RR_THRESHOLD_BAND"}),
+        ],
+    )
+    regression_trip, regression_reason = should_trip(regressed)
+    r.check(
+        "19a a correction that adds violations trips the regression rule",
+        regression_trip and "regression" in regression_reason,
+        "TRIP_ON_REGRESSION is the one breaker policy with no coverage "
+        "anywhere else in this suite: a refine that broke more than it fixed "
+        "must stop the loop rather than compound the damage. Got trip="
+        f"{regression_trip}, reason={regression_reason!r}",
+    )
+
+    # The CLI budget override rebinds a module-level constant that `should_trip`
+    # reads at call time. Restored in the `finally` so no later case inherits it.
+    from .__main__ import apply_max_attempts_override, main as cli_main
+
+    original_budget = breaker_policy.MAX_REFINE_ATTEMPTS
+    try:
+        apply_max_attempts_override(1)
+        budget_state = ItemBreakerState(
+            key="budget", attempts=1, history=[frozenset({"R1_SALT_MISMATCH"})]
+        )
+        budget_trip, budget_reason = should_trip(budget_state)
+        r.check(
+            "19b --max-attempts reaches the breaker, not just the parser",
+            breaker_policy.MAX_REFINE_ATTEMPTS == 1
+            and budget_trip
+            and "attempt budget" in budget_reason,
+            "An item at 1 refine attempt must trip once the budget is 1. If "
+            "the override only changed a local variable, the breaker would "
+            f"still be using {original_budget}. Got trip={budget_trip}, "
+            f"reason={budget_reason!r}",
+        )
+    finally:
+        apply_max_attempts_override(original_budget)
+    # stderr is captured rather than let through: the CLI's refusal message is
+    # correct behaviour here, and printing it unbuffered puts the word "Error"
+    # at the top of an otherwise all-green self-test run.
+    rejected_stderr = io.StringIO()
+    with contextlib.redirect_stderr(rejected_stderr):
+        rejected_exit = cli_main(["--max-attempts", "0"])
+    r.check(
+        "19c a budget of zero is rejected before anything runs",
+        rejected_exit == 2 and "at least 1" in rejected_stderr.getvalue(),
+        "A budget of 0 would escalate every item without attempting a single "
+        "correction, so the CLI refuses it with an explanation rather than "
+        f"producing a run whose escalations mean nothing. Exit {rejected_exit}, "
+        f"stderr {rejected_stderr.getvalue()!r}",
+    )
+
+    # ------------------------------------------------------------------
+    print("")
+    print("[20] JSON extraction — the live path's first point of failure")
+    # ------------------------------------------------------------------
+    # Unreachable from --offline: a fixture returns objects, never text. Every
+    # live reply goes through this function first, so a bug here fails the live
+    # run on its very first call and nothing offline would have noticed.
+    r.check(
+        "20a a fenced code block yields the object",
+        extract_json_object('```json\n{"a": 1}\n```') == {"a": 1},
+        "Models routinely wrap JSON in a markdown fence despite being told not "
+        "to.",
+    )
+    r.check(
+        "20b prose before and after the object is ignored",
+        extract_json_object('Here is the row:\n{"a": 1}\nHope that helps!')
+        == {"a": 1},
+        "A closing remark after valid JSON must not cost the run an attempt.",
+    )
+    r.check(
+        "20c a brace inside a string does not end the scan early",
+        extract_json_object('{"note": "a { brace", "b": 2}')
+        == {"note": "a { brace", "b": 2},
+        "AuthoringNote is free text a model can put anything in, including a "
+        "brace.",
+    )
+    r.check(
+        "20d an escaped quote inside a string is honoured",
+        extract_json_object('{"note": "she said \\"ok\\"", "b": 2}')
+        == {"note": 'she said "ok"', "b": 2},
+        "Backslash escapes must not be mistaken for the end of the string.",
+    )
+    r.check(
+        "20e nested objects return the outermost one",
+        extract_json_object('{"row": {"Name": "Casualty_X"}}')
+        == {"row": {"Name": "Casualty_X"}},
+        "The item shape is two nested objects; stopping at the first closing "
+        "brace would truncate it.",
+    )
+    r.check(
+        "20f a reply with no JSON raises GenerationError",
+        _raises_generation_error(lambda: extract_json_object("I cannot do that.")),
+        "A refusal or a prose-only reply must become a retryable finding, not "
+        "a crash.",
+    )
+    r.check(
+        "20g a truncated object raises GenerationError",
+        _raises_generation_error(
+            lambda: extract_json_object('{"row": {"Name": "Casualty_X"')
+        ),
+        "Hitting the token limit mid-object is the most likely live failure of "
+        "all, and it must be retryable rather than fatal.",
+    )
+
+    # ------------------------------------------------------------------
+    print("")
+    print("[21] CSV cell rendering")
+    # ------------------------------------------------------------------
+    # In Python a bool IS an int, so an ordering mistake in _csv_cell writes
+    # `bApplyInitialVitalsOverride` as 1/0 instead of true/false. Unreal's
+    # importer reads the column as a bool and the row's whole vitals gate turns
+    # on it, which makes this a one-line change with a silent, large blast
+    # radius.
+    r.check(
+        "21a booleans render as Unreal's lowercase true/false",
+        _csv_cell(True) == "true" and _csv_cell(False) == "false",
+        "The exemplar CSV writes `true`. Got "
+        f"{_csv_cell(True)!r} / {_csv_cell(False)!r}.",
+    )
+    r.check(
+        "21b the bool branch is checked before the numeric one",
+        _csv_cell(False) != "0" and _csv_cell(True) != "1",
+        "bool is a subclass of int in Python, so a float/int branch placed "
+        "first swallows every boolean column silently.",
+    )
+    r.check(
+        "21c whole floats lose the trailing .0 and decimals survive",
+        _csv_cell(120.0) == "120" and _csv_cell(97.4) == "97.4",
+        "Both parse identically as floats on import; what matters is that no "
+        f"value renders in scientific notation. Got {_csv_cell(120.0)!r} / "
+        f"{_csv_cell(97.4)!r}.",
+    )
+    r.check(
+        "21d strings pass through untouched",
+        _csv_cell("/Game/GoldenHour/Characters/CasualtyT1/Casualty_01")
+        == "/Game/GoldenHour/Characters/CasualtyT1/Casualty_01",
+        "Asset paths and site tags must reach the CSV exactly as authored.",
+    )
+
+    # ------------------------------------------------------------------
+    print("")
+    print("[22] End to end: an escalated row never reaches the CSV")
+    # ------------------------------------------------------------------
+    # The central safety claim of this submission, and it was resting on
+    # inspection of one committed artifact. Driven here through the real
+    # `run_requests`, into a temporary directory, with one item that passes and
+    # one the refiner cannot fix.
+    print("      (the progress lines below are a real run, into a temp directory)")
+    with tempfile.TemporaryDirectory() as tmp:
+        exclusion_dir = Path(tmp)
+        exclusion_run = run_requests(
+            (_CLEAN_REQUEST, _UNFIXABLE_REQUEST),
+            generator=_ScriptedGenerator(),
+            refiner=_EchoRefiner(),
+            mode="selftest",
+            model="selftest-fixture",
+            output_dir=exclusion_dir,
+        )
+        csv_text = (
+            exclusion_dir / "DT_CasualtyArchetypes.generated.csv"
+        ).read_text(encoding="utf-8")
+        notes_text = (
+            exclusion_dir / "DT_CasualtyArchetypes.generated.notes.md"
+        ).read_text(encoding="utf-8")
+        escalation_exists = (
+            exclusion_dir / "escalations" / f"{_UNFIXABLE_REQUEST.key}.md"
+        ).is_file()
+
+    r.check(
+        "22a the accepted row is in the CSV",
+        "Casualty_Selftest_Clean" in csv_text,
+        f"A passing item must ship. CSV:\n{csv_text}",
+    )
+    r.check(
+        "22b the escalated row is NOT in the CSV",
+        "Casualty_Selftest_Unfixable" not in csv_text,
+        "A row the pipeline knows is incoherent is worse than a missing row: "
+        "it imports cleanly, looks plausible, and silently supplies the wrong "
+        f"ground truth to scoring. CSV:\n{csv_text}",
+    )
+    r.check(
+        "22c the escalation report was written instead",
+        escalation_exists and exclusion_run.escalated,
+        "Withholding the row is only half the job; the decision has to reach a "
+        f"human. Escalated: {[o.request.key for o in exclusion_run.escalated]}",
+    )
+    r.check(
+        "22d the sibling notes file carries the placeholder labelling",
+        "Casualty_Selftest_Clean" in notes_text
+        and "SME validation pending" in notes_text
+        and "Casualty_Selftest_Unfixable" in notes_text
+        and "refused to ship" in notes_text,
+        "AuthoringNote is not one of the 24 CSV columns, so the label R3 "
+        "enforces only survives into the artifact if the sibling notes file "
+        "carries it — and the file must also name what was held back.",
+    )
+
+    # ------------------------------------------------------------------
+    print("")
+    print("[23] End to end: the run-level breaker stops a bad run")
+    # ------------------------------------------------------------------
+    # `RunBreaker` was unit-tested in isolation but unreachable in practice:
+    # with the seven shipped fixtures the worst case is 1 escalation in 7, and
+    # no CLI flag can move that. This drives three requests that all escalate,
+    # with the item budget lowered through the same override the CLI uses, and
+    # proves the run actually stops rather than grinding through the rest.
+    print("      (the abort banner below is the expected result of this section)")
+    run_budget = breaker_policy.MAX_REFINE_ATTEMPTS
+    try:
+        apply_max_attempts_override(1)
+        with tempfile.TemporaryDirectory() as tmp:
+            abort_dir = Path(tmp)
+            abort_run = run_requests(
+                _ABORT_REQUESTS,
+                generator=_ScriptedGenerator(),
+                refiner=_ShufflingRefiner(),
+                mode="selftest",
+                model="selftest-fixture",
+                output_dir=abort_dir,
+            )
+            abort_csv = (
+                abort_dir / "DT_CasualtyArchetypes.generated.csv"
+            ).read_text(encoding="utf-8")
+    finally:
+        apply_max_attempts_override(run_budget)
+
+    r.check(
+        "23a the run aborts once a majority of completed items have escalated",
+        abort_run.aborted and "run aborted" in abort_run.abort_reason.lower(),
+        "A majority escalating is a prompt, model or rule problem — more "
+        f"retries will not fix it. Aborted={abort_run.aborted}, reason="
+        f"{abort_run.abort_reason!r}",
+    )
+    r.check(
+        "23b it stops early instead of finishing the request list",
+        len(abort_run.outcomes) == 2 and abort_run.requested == 3,
+        "Stopping is the whole point; a breaker that lets the run finish is a "
+        f"log message. Processed {len(abort_run.outcomes)} of "
+        f"{abort_run.requested}.",
+    )
+    r.check(
+        "23c every item tripped on the overridden attempt budget",
+        all(
+            "attempt budget" in outcome.trip_reason
+            for outcome in abort_run.escalated
+        ),
+        "This also proves the --max-attempts override reaches the breaker in a "
+        "real run, not just in a unit check. Reasons: "
+        f"{[o.trip_reason for o in abort_run.escalated]}",
+    )
+    r.check(
+        "23d an aborted run ships no rows at all",
+        abort_csv.strip().splitlines() == [",".join(CSV_COLUMNS)],
+        "Every item escalated, so the CSV must be a header and nothing else — "
+        "the `finally` still writes it, and writing a header-only file is the "
+        f"honest output. Got:\n{abort_csv}",
     )
 
     # ------------------------------------------------------------------
