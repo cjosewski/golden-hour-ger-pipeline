@@ -156,6 +156,18 @@ class TriageIntent(BaseModel):
     AuthoringNote: str
 
 
+# The authoring-intent fields that are *not* CSV columns, derived by set
+# difference rather than counted by hand. The generated notes file states this
+# count in prose ("Five things below are not columns of the 24-column CSV"), and
+# a hand-typed number there is a falsifiable claim that goes stale the moment a
+# field is added: the file shipped saying "three" while the block beneath it
+# rendered five. Deriving it means the sentence cannot drift from the model, and
+# `selftest.py` case 22e asserts the artifact's stated count against this tuple.
+NON_CSV_INTENT_FIELDS: tuple[str, ...] = tuple(
+    name for name in TriageIntent.model_fields if name not in CSV_COLUMNS
+)
+
+
 class GeneratedArchetype(BaseModel):
     """One complete generated item: the shippable row plus its authoring intent."""
 

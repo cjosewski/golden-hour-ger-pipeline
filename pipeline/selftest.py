@@ -19,6 +19,13 @@ whole suite. Every derivation in the graded rule needs at least one case where
 it is the *only* thing that can decide the answer; otherwise the suite is
 testing the fixtures, not the rule.
 
+Cases 22e and 22f are the guard on a count the notes file states in prose. It
+shipped saying "Three things below are not columns of the 24-column CSV" while
+`TriageIntent` had five — a falsifiable claim in a graded artifact, and the
+second hand-typed count in this project to go stale. The number is now derived
+from the model; those two cases check the artifact against the model rather than
+against the sentence that wrote it.
+
 Sections 17 to 23 come from a review that found the untested paths were the
 load-bearing ones: what the run log actually renders (17), a transport failure
 being reported as a content problem (18), the one breaker rule with no coverage
@@ -39,6 +46,7 @@ from __future__ import annotations
 import contextlib
 import csv
 import io
+import re
 import tempfile
 from pathlib import Path
 
@@ -1581,6 +1589,70 @@ def run_selftest() -> int:
         "AuthoringNote is not one of the 24 CSV columns, so the label R3 "
         "enforces only survives into the artifact if the sibling notes file "
         "carries it — and the file must also name what was held back.",
+    )
+
+    # 22e/22f exist because the shipped notes file asserted "Three things below
+    # are not columns of the 24-column CSV" while `TriageIntent` had five, two
+    # of which the same block rendered on every row. The count is now derived,
+    # so these two guard the derivation rather than the sentence: 22e catches a
+    # number typed back in by hand, 22f catches a field added to the model with
+    # no documented reason behind it. The real count is recomputed here from the
+    # model rather than imported, so a bug in the derivation itself fails too.
+    real_non_columns = tuple(
+        name for name in TriageIntent.model_fields if name not in CSV_COLUMNS
+    )
+    # Transcribed independently of `orchestrate._COUNT_WORDS`: a test that reads
+    # the number back through the same table it was written with proves nothing.
+    word_to_int = {
+        "zero": 0,
+        "one": 1,
+        "two": 2,
+        "three": 3,
+        "four": 4,
+        "five": 5,
+        "six": 6,
+        "seven": 7,
+        "eight": 8,
+        "nine": 9,
+        "ten": 10,
+    }
+    stated_match = re.search(
+        r"\. ([A-Za-z]+) things below are \*\*not columns of the "
+        r"(\d+)-column CSV\*\*",
+        notes_text,
+    )
+    stated_count = (
+        word_to_int.get(stated_match.group(1).casefold()) if stated_match else None
+    )
+    stated_columns = int(stated_match.group(2)) if stated_match else None
+    matched_sentence = stated_match.group(0) if stated_match else "(no match)"
+    r.check(
+        "22e the notes file's stated non-column count matches the schema",
+        stated_count == len(real_non_columns)
+        and stated_columns == len(CSV_COLUMNS),
+        "The sentence must be derived from `TriageIntent` minus `CSV_COLUMNS`, "
+        f"not typed. Model says {len(real_non_columns)} "
+        f"({', '.join(real_non_columns)}) across {len(CSV_COLUMNS)} columns; "
+        f"the artifact says {stated_count} across {stated_columns} — "
+        f"{matched_sentence!r}.",
+    )
+
+    listed_block = notes_text.partition("live here instead")[2].partition(
+        "## Placeholder-labelling status"
+    )[0]
+    listed_items = re.findall(r"^(\d+)\. ", listed_block, flags=re.MULTILINE)
+    r.check(
+        "22f every non-column field is listed with a documented reason",
+        len(listed_items) == len(real_non_columns)
+        and listed_items == [str(n + 1) for n in range(len(real_non_columns))]
+        and "**undocumented**" not in listed_block,
+        "A field added to `TriageIntent` must arrive with the reason it is not "
+        "a CSV column, or this file starts describing a shape it no longer "
+        f"has. Model has {len(real_non_columns)} non-column field(s) "
+        f"({', '.join(real_non_columns)}); the artifact lists "
+        f"{len(listed_items)} item(s) {listed_items} and "
+        f"{'contains' if '**undocumented**' in listed_block else 'contains no'}"
+        " undocumented entry.",
     )
 
     # ------------------------------------------------------------------

@@ -19,7 +19,7 @@ than scripted animation.
 
 | Criterion | Where it is satisfied |
 |---|---|
-| **Working Pipeline** | [`orchestrate.py`](pipeline/orchestrate.py) runs the full loop with the circuit breaker and writes every artifact. `--offline`: 7 requests, 6 accepted, 1 escalated, 13 drafts, breaker tripped on the designed unfixable item. `--selftest`: 82/82, including two runs driven into a temp directory that prove an escalated row never reaches the CSV and that the run-level breaker actually stops a run. |
+| **Working Pipeline** | [`orchestrate.py`](pipeline/orchestrate.py) runs the full loop with the circuit breaker and writes every artifact. `--offline`: 7 requests, 6 accepted, 1 escalated, 13 drafts, breaker tripped on the designed unfixable item. `--selftest`: 84/84, including two runs driven into a temp directory that prove an escalated row never reaches the CSV and that the run-level breaker actually stops a run. |
 | **Evaluator Quality** | [`salt.py`](pipeline/salt.py) + [`evaluator.py`](pipeline/evaluator.py) are pure Python, zero LLM — the rule is a decision tree written down in a GDD, so it is decidable, and asking a model would trade a guaranteed answer for a probabilistic one. Four rule families, each with a real catch quoted under *What the pipeline caught*, plus an escalation. Every rule names its authority: a `knowledge_base/` file and section where a document publishes it, and an explicit "physiological invariant" or engine-behaviour label where none does — never blurred. The exception is `GEN_INVALID_JSON`, not a content rule but the synthetic violation a malformed role reply becomes so the loop can retry it; it cites `pipeline/schema.py`. |
 | **Game Connection** | The content type is the real `DT_CasualtyArchetypes`, whose 24-column header the generated CSV reproduces byte-for-byte (self-test 15a guards it), shipped with the sibling notes file the project's own data rule requires. The gap is evidenced, the rule is quoted from `triage-system.md`, the field semantics and vitals gate come from the project's schema decision record, and the single escalation lands on the game's live `[To be designed]` open question. |
 | **ReadMe** | This file: the game, zero-credential commands up front, the verbatim declaration with its provenance caveat, the three bugs this found in my own evaluator, the evidenced gap, the rule with file and section, the diagram, real quoted findings, and an explicit verified-vs-not section. |
@@ -39,7 +39,7 @@ cd golden-hour-ger-pipeline
 uv sync
 
 # Offline — no API key needed, nothing leaves the machine. Grade these two:
-uv run python -m pipeline --selftest     # 82 assertions: SALT truth table, rules, breaker, prompts, CSV contract
+uv run python -m pipeline --selftest     # 84 assertions: SALT truth table, rules, breaker, prompts, CSV contract
 uv run python -m pipeline --offline      # full GER loop with deterministic fixtures
 
 # Live run — CAUTION: this path has NEVER been executed. No API key existed in
@@ -186,8 +186,11 @@ because it is the *sole* input to question (a).
 **output** of the Pulse pipeline, and "carrying them here would misrepresent
 them as authored config when they are computed state". So it travels as
 authoring intent beside the declared category, never as shipped data, and the
-generated notes file lists it as the third of the file's three deliberate
-non-columns rather than leaving a reader to assume it was forgotten.
+generated notes file lists it as one of the five deliberate non-columns the file
+enumerates — each with its own documented reason — rather than leaving a reader
+to assume any of them was forgotten. That count is derived from the model rather
+than typed into the prose, and self-test cases 22e/22f fail if the file's stated
+number stops matching the fields it describes.
 
 One gate sits in front of all of it.
 [`casualty-archetype-schema.md`](knowledge_base/casualty-archetype-schema.md)
@@ -414,7 +417,7 @@ successful refines, and one escalation.
 | [`refiner.py`](pipeline/refiner.py) | Live refiner and the offline fixture |
 | [`breaker.py`](pipeline/breaker.py) | Per-item `should_trip` + run-level `RunBreaker` |
 | [`orchestrate.py`](pipeline/orchestrate.py) | The GER loop and every output writer |
-| [`selftest.py`](pipeline/selftest.py) | 82 offline assertions |
+| [`selftest.py`](pipeline/selftest.py) | 84 offline assertions |
 | [`__main__.py`](pipeline/__main__.py) | CLI + top-level error guard |
 
 ## What is verified vs. not
@@ -422,7 +425,7 @@ successful refines, and one escalation.
 **Verified by running it, on this machine:**
 
 - `uv sync` on pinned Python 3.13 (system default here is 3.14) — 16 packages.
-- `--selftest`: **82/82 pass, exit 0** — including the GDD's worked example, the
+- `--selftest`: **84/84 pass, exit 0** — including the GDD's worked example, the
   question-(c) inversion guard, the two mutation guards, the vitals gate, the
   JSON extractor against fenced / prose-wrapped / brace-in-string /
   escaped-quote / no-JSON / truncated input, and the two end-to-end runs above.

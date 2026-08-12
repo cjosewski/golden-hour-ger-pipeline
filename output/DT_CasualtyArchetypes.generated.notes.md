@@ -2,17 +2,19 @@
 
 > **Sibling file**: `DT_CasualtyArchetypes.generated.csv` — 6 accepted row(s)
 > **Produced by**: this repo's GER pipeline, offline mode, model `offline-deterministic-fixture`
-> **Run at**: 2026-08-12T22:31:23+00:00
+> **Run at**: 2026-08-12T23:31:08+00:00
 > **Schema authority**: `knowledge_base/casualty-archetype-schema.md` (`F_CasualtyArchetypeRow`, 23 authored fields in Groups 1–7; the DataTable adds the engine's own `Name` key column, which is why the CSV has 24)
 > **Rule enforced on every row below**: `knowledge_base/triage-system.md` § Formulas — Ground-Truth Category Derivation
 
 Why this is a sibling file rather than a comment block inside the CSV: `knowledge_base/data-files.md` § Carve-out states that "Unreal's CSV importer has no comment syntax — the first row is always literal headers", and instructs authors to "put per-value sourcing/placeholder documentation in a sibling `<Name>.notes.md`, never inline". The hand-authored table in the game repo ships one of these; the generated table now does too.
 
-There is a second reason specific to this pipeline. Three things below are **not columns of the 24-column CSV**, and each is absent for its own documented reason, so all three live here instead, next to the file they describe.
+There is a second reason specific to this pipeline. Five things below are **not columns of the 24-column CSV**, and each is absent for its own documented reason, so all five live here instead, next to the file they describe.
 
 1. `AuthoringNote`. Rule R3 requires every generated row to carry the "clinically plausible placeholder — SME validation pending" label on it, and the CSV has nowhere to put it.
 2. The declared SALT category. Deliberately absent: `triage-system.md` § Summary keeps the ground-truth category "derived live from their Pulse physiology state — not a static, author-placed tag".
 3. `InitialConsciousness01`. Also deliberately absent, and the one most likely to be misread as an oversight, because it is the **sole input to SALT question (a)** — whether the casualty obeys commands or shows purposeful movement. `knowledge_base/casualty-archetype-schema.md` § Group 1 excludes it from the row on purpose: "`ConsciousnessLevel01` and `PainLevel01` are deliberately **not** carried as initial-override fields: a pre-insult baseline is definitionally alert and pain-free, and both are physiology *outputs* of the pipeline (Stage 1 read / Stage 3 derived) rather than archetype-authored inputs — carrying them here would misrepresent them as authored config when they are computed state." So the value below is authoring *intent* used to derive ground truth, never a shipped column, and the per-row lists say "vitals and authoring intent" rather than "vitals" for that reason.
+4. `bMinorInjuriesOnly` — the Green-vs-Yellow split. `triage-system.md` § Detailed Design — Core Rules, rule 2.4: "**All four true** → check for minor-injuries-only: if yes, category = **Minimal (Green)**; if no (injured but stable), category = **Delayed (Yellow)**." Nothing on the row represents the injury loadout that check reads, so it is authored per row.
+5. `bSurvivableWithResources` — the Red-vs-Gray split, and the field this run's one escalation turns on. `triage-system.md` § Formulas flags it **[To be designed]**: "Do not hardcode this as always-true; it needs an explicit design decision before the Expectant category can be authored honestly." So it is authored per row and never inferred here.
 
 ## Placeholder-labelling status of every generated row
 

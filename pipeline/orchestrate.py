@@ -32,6 +32,7 @@ from .requests import REQUESTS, ArchetypeRequest
 from .salt import derive_inputs_from_row, failing_salt_questions
 from .schema import (
     CSV_COLUMNS,
+    NON_CSV_INTENT_FIELDS,
     ArchetypeRow,
     EvaluationResult,
     GeneratedArchetype,
@@ -1067,6 +1068,111 @@ def _label_status(note: str) -> str:
     return "present" if has_placeholder_label(note) else "**MISSING**"
 
 
+# Why each authoring-intent field is not a CSV column, keyed by field name so
+# the notes file's list is generated from `TriageIntent` rather than typed out
+# beside it. Presentation order is this dict's order; the count in the prose
+# above the list is `len(NON_CSV_INTENT_FIELDS)`, not a number typed here.
+_NON_COLUMN_REASONS: dict[str, str] = {
+    "AuthoringNote": (
+        "`AuthoringNote`. Rule R3 requires every generated row to carry the "
+        "\"clinically plausible placeholder — SME validation pending\" label "
+        "on it, and the CSV has nowhere to put it."
+    ),
+    "DeclaredCategory": (
+        "The declared SALT category. Deliberately absent: "
+        "`triage-system.md` § Summary keeps the ground-truth category "
+        "\"derived live from their Pulse physiology state — not a static, "
+        "author-placed tag\"."
+    ),
+    "InitialConsciousness01": (
+        "`InitialConsciousness01`. Also deliberately absent, and the one "
+        "most likely to be misread as an oversight, because it is the **sole "
+        "input to SALT question (a)** — whether the casualty obeys commands "
+        "or shows purposeful movement. "
+        "`knowledge_base/casualty-archetype-schema.md` § Group 1 excludes it "
+        "from the row on purpose: \"`ConsciousnessLevel01` and `PainLevel01` "
+        "are deliberately **not** carried as initial-override fields: a "
+        "pre-insult baseline is definitionally alert and pain-free, and both "
+        "are physiology *outputs* of the pipeline (Stage 1 read / Stage 3 "
+        "derived) rather than archetype-authored inputs — carrying them here "
+        "would misrepresent them as authored config when they are computed "
+        "state.\" So the value below is authoring *intent* used to derive "
+        "ground truth, never a shipped column, and the per-row lists say "
+        "\"vitals and authoring intent\" rather than \"vitals\" for that "
+        "reason."
+    ),
+    "bMinorInjuriesOnly": (
+        "`bMinorInjuriesOnly` — the Green-vs-Yellow split. "
+        "`triage-system.md` § Detailed Design — Core Rules, rule 2.4: "
+        "\"**All four true** → check for minor-injuries-only: if yes, "
+        "category = **Minimal (Green)**; if no (injured but stable), category "
+        "= **Delayed (Yellow)**.\" Nothing on the row represents the injury "
+        "loadout that check reads, so it is authored per row."
+    ),
+    "bSurvivableWithResources": (
+        "`bSurvivableWithResources` — the Red-vs-Gray split, and the field "
+        "this run's one escalation turns on. `triage-system.md` § Formulas "
+        "flags it **[To be designed]**: \"Do not hardcode this as "
+        "always-true; it needs an explicit design decision before the "
+        "Expectant category can be authored honestly.\" So it is authored "
+        "per row and never inferred here."
+    ),
+}
+
+# Small-number words, so the sentence above the list reads as prose while the
+# number itself still comes from the model. Anything past the table falls back
+# to digits rather than guessing at English.
+_COUNT_WORDS: tuple[str, ...] = (
+    "zero",
+    "one",
+    "two",
+    "three",
+    "four",
+    "five",
+    "six",
+    "seven",
+    "eight",
+    "nine",
+    "ten",
+)
+
+
+def _count_word(count: int) -> str:
+    """`5` → "five". Digits past the small-number table."""
+    return _COUNT_WORDS[count] if 0 <= count < len(_COUNT_WORDS) else str(count)
+
+
+def _non_column_items() -> list[str]:
+    """The numbered "not a CSV column" list, one entry per intent field.
+
+    Built from `NON_CSV_INTENT_FIELDS` so the list cannot be shorter than the
+    model. A field added to `TriageIntent` with no entry in `_NON_COLUMN_REASONS`
+    still gets a line — an undocumented one that says so — because a silently
+    omitted field is exactly the defect this list is generated to prevent.
+    Self-test case 22f fails on that line, so the gap reaches a human.
+    """
+    items: list[str] = []
+    for index, name in enumerate(
+        sorted(
+            NON_CSV_INTENT_FIELDS,
+            key=lambda field_name: (
+                list(_NON_COLUMN_REASONS).index(field_name)
+                if field_name in _NON_COLUMN_REASONS
+                else len(_NON_COLUMN_REASONS)
+            ),
+        ),
+        start=1,
+    ):
+        reason = _NON_COLUMN_REASONS.get(
+            name,
+            f"`{name}` — **undocumented**: added to `TriageIntent` after these "
+            "notes were written, with no recorded reason for its absence from "
+            "the CSV. Document it in `_NON_COLUMN_REASONS`.",
+        )
+        items.append(f"{index}. {reason}")
+    return items
+
+
 def write_generated_notes(run: RunResult, path: Path) -> None:
     """The CSV's sibling notes file: provenance the CSV itself cannot carry.
 
@@ -1111,33 +1217,17 @@ def write_generated_notes(run: RunResult, path: Path) -> None:
         "never inline\". The hand-authored table in the game repo ships one of "
         "these; the generated table now does too.",
         "",
-        "There is a second reason specific to this pipeline. Three things "
+        # The count is derived from `TriageIntent`, never typed: this sentence
+        # shipped saying "Three" while the block below it rendered five, and a
+        # falsifiable count in a graded artifact costs more than the gap it hides.
+        "There is a second reason specific to this pipeline. "
+        f"{_count_word(len(NON_CSV_INTENT_FIELDS)).capitalize()} things "
         "below are **not columns of the 24-column CSV**, and each is absent "
-        "for its own documented reason, so all three live here instead, next "
+        f"for its own documented reason, so all "
+        f"{_count_word(len(NON_CSV_INTENT_FIELDS))} live here instead, next "
         "to the file they describe.",
         "",
-        "1. `AuthoringNote`. Rule R3 requires every generated row to carry the "
-        "\"clinically plausible placeholder — SME validation pending\" label "
-        "on it, and the CSV has nowhere to put it.",
-        "2. The declared SALT category. Deliberately absent: "
-        "`triage-system.md` § Summary keeps the ground-truth category "
-        "\"derived live from their Pulse physiology state — not a static, "
-        "author-placed tag\".",
-        "3. `InitialConsciousness01`. Also deliberately absent, and the one "
-        "most likely to be misread as an oversight, because it is the **sole "
-        "input to SALT question (a)** — whether the casualty obeys commands "
-        "or shows purposeful movement. "
-        "`knowledge_base/casualty-archetype-schema.md` § Group 1 excludes it "
-        "from the row on purpose: \"`ConsciousnessLevel01` and `PainLevel01` "
-        "are deliberately **not** carried as initial-override fields: a "
-        "pre-insult baseline is definitionally alert and pain-free, and both "
-        "are physiology *outputs* of the pipeline (Stage 1 read / Stage 3 "
-        "derived) rather than archetype-authored inputs — carrying them here "
-        "would misrepresent them as authored config when they are computed "
-        "state.\" So the value below is authoring *intent* used to derive "
-        "ground truth, never a shipped column, and the per-row lists say "
-        "\"vitals and authoring intent\" rather than \"vitals\" for that "
-        "reason.",
+        *_non_column_items(),
         "",
         "## Placeholder-labelling status of every generated row",
         "",
