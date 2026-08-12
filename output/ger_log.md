@@ -2,7 +2,7 @@
 
 - **Mode**: offline
 - **Model**: `offline-deterministic-fixture`
-- **Run at**: 2026-08-12T21:12:12+00:00
+- **Run at**: 2026-08-12T22:31:23+00:00
 - **Requested**: 7 · **Accepted**: 6 · **Escalated**: 1
 - **Breaker policy**: max 3 refine attempts per item; run aborts above 50% escalations
 

@@ -6,6 +6,11 @@ CRITICAL — WHAT THE GENERATOR MUST NOT RECEIVE
 The SALT decision tree, the seven-input derivation table, and the R1 rule text
 are **deliberately absent from the generator prompt**. Do not add them.
 
+This is enforced, not just requested: self-test section 24 builds the generator
+prompt for all seven requests and fails if any of them contains a fingerprint of
+the rule — including by way of the field-group excerpt sliced live out of the
+schema document below, which is the likeliest place for a citation to creep in.
+
 Rationale, learned the expensive way on Assignment #4 of this course: when the
 generator is handed the exact rule it is about to be checked against, it
 self-censors. Every item passes on the first attempt, the evaluator logs

@@ -102,7 +102,7 @@ class ArchetypeRow(BaseModel):
 
 
 # The CSV column order, derived from the model so it cannot drift from the
-# struct. `selftest.py` case 11 asserts this tuple equals the exemplar CSV's
+# struct. `selftest.py` case 15a asserts this tuple equals the exemplar CSV's
 # header exactly — that assertion is the guard that keeps generated output
 # importable into the real DataTable.
 CSV_COLUMNS: tuple[str, ...] = tuple(ArchetypeRow.model_fields)

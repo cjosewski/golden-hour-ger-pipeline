@@ -144,19 +144,46 @@ class RunBreaker:
     Rationale for existing at all: a per-item breaker catches a bad *item*. It
     cannot see that the whole run is failing. If a majority of items are
     escalating, the problem is not any one casualty — it is the prompt, the
-    model, or the rule itself. That is a design problem for a human to look at,
-    and no additional retries will fix it. Continuing would just spend the rest
-    of the budget confirming what the first few items already established.
+    model, the rule itself, or the transport underneath all three. Whichever it
+    is, it is a problem for a human to look at and no additional retries will
+    fix it. Continuing would just spend the rest of the budget confirming what
+    the first few items already established.
+
+    ``transport_escalated`` is tracked separately from ``escalated`` so the
+    abort message can name which of those it is. That distinction is not
+    cosmetic: content and transport failures are read by different people and
+    fixed in different places.
     """
 
     completed: int = 0
     escalated: int = 0
+    transport_escalated: int = 0
 
-    def record(self, *, escalated: bool) -> None:
-        """Record one finished item, accepted or escalated."""
+    def record(self, *, escalated: bool, trip_reason: str = "") -> None:
+        """Record one finished item, accepted or escalated.
+
+        ``trip_reason`` is the escalated item's trip reason, so this level can
+        make the same content-versus-transport distinction the per-item level
+        makes. Without it a rate-limit storm that escalates two items out of two
+        aborted the run with "a prompt, model, or rule problem for a human to
+        resolve" — the exact misdiagnosis `should_trip` was rewritten to
+        prevent, sending whoever reads it to the GDD over a network outage.
+
+        An escalation recorded with no reason counts as a content failure. That
+        is the conservative default: it is what this class did before the
+        distinction existed, and it points a reader at the rules rather than
+        blaming an outage that may not have happened.
+        """
         self.completed += 1
         if escalated:
             self.escalated += 1
+            if is_transport_trip(trip_reason):
+                self.transport_escalated += 1
+
+    @property
+    def content_escalated(self) -> int:
+        """Escalations caused by a row breaking a rule, not by a failed call."""
+        return self.escalated - self.transport_escalated
 
     @property
     def escalation_ratio(self) -> float:
@@ -171,16 +198,49 @@ class RunBreaker:
         Requires at least 2 completed items before it can fire: aborting a run
         because its single first item escalated would make one unlucky casualty
         look like a systemic failure.
+
+        The abort threshold is the same whatever caused the escalations — a run
+        where most calls are failing should stop either way — but the *reason*
+        is not, because the reason is the whole product of an abort. A run
+        killed by an expired API key and a run killed by a broken rule need
+        different people looking at different things.
         """
         if self.completed < 2:
             return (False, "")
-        if self.escalation_ratio > RUN_ABORT_ESCALATION_RATIO:
+        if self.escalation_ratio <= RUN_ABORT_ESCALATION_RATIO:
+            return (False, "")
+
+        headline = (
+            f"run aborted: {self.escalated} of {self.completed} completed items "
+            f"escalated ({self.escalation_ratio:.0%}), above the "
+            f"{RUN_ABORT_ESCALATION_RATIO:.0%} tolerance. "
+        )
+
+        if self.transport_escalated == self.escalated:
             return (
                 True,
-                f"run aborted: {self.escalated} of {self.completed} completed "
-                f"items escalated ({self.escalation_ratio:.0%}), above the "
-                f"{RUN_ABORT_ESCALATION_RATIO:.0%} tolerance. A majority of items "
-                "failing is a prompt, model, or rule problem for a human to "
-                "resolve — more retries will not fix it",
+                headline + "Every one of those escalations was a "
+                f"{TRANSPORT_TRIP_PREFIX}: the role calls returned nothing "
+                "usable, so no draft was evaluated and no rule was ever "
+                "checked. This says nothing about the rows, the prompt or the "
+                "rule — it is an API key, rate limit or network problem. Fix "
+                "that and re-run; there is no design decision waiting here",
             )
-        return (False, "")
+
+        if self.transport_escalated:
+            return (
+                True,
+                headline + f"{self.transport_escalated} of them were transport "
+                "failures (role calls that returned nothing usable) and "
+                f"{self.content_escalated} were content failures, so this run "
+                "is failing for two unrelated reasons at once. Clear the "
+                "transport problem and re-run before reading the content "
+                "escalations as evidence about the prompt or the rule",
+            )
+
+        return (
+            True,
+            headline + "A majority of items failing is a prompt, model, or "
+            "rule problem for a human to resolve — more retries will not fix "
+            "it",
+        )

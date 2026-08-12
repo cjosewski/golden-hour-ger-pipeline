@@ -15,6 +15,28 @@ from . import breaker
 from .orchestrate import DEFAULT_OUTPUT_DIR, run_pipeline
 
 
+def _make_console_printable() -> None:
+    """Stop an unencodable character from killing a run on its way to the console.
+
+    Found by deliberately breaking self-test 24a to check it fails loudly. It
+    did not: the failure *message* named the leaked fingerprint with an arrow,
+    and on a Windows console — cp1252 by default, and cp1252 has no U+2192 —
+    printing it raised `UnicodeEncodeError`. The top-level guard turned that
+    into "Error: 'charmap' codec can't encode character", the summary line never
+    printed, and the one thing a failing check exists to produce was lost.
+
+    Every rule name, GDD quotation and change line in this project uses em
+    dashes, middots, ellipses and arrows, so this is not a corner case; the log
+    *files* are written as UTF-8 explicitly and were never at risk, but stdout
+    takes whatever the console offers. Replacing an unencodable character with a
+    substitution mark degrades one glyph. Raising loses the whole report.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(errors="replace")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m pipeline",
@@ -69,6 +91,7 @@ def apply_max_attempts_override(value: int) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    _make_console_printable()
     args = build_parser().parse_args(argv)
 
     if args.selftest:

@@ -1,9 +1,9 @@
 """Offline self-test. No API key, no network.
 
-Twenty-three numbered sections covering the SALT derivation, the evaluator's
+Twenty-four numbered sections covering the SALT derivation, the evaluator's
 rule families, the circuit breaker at both levels, the knowledge-base loaders,
-the CSV contract, the run log's rendering, and the GER loop's recovery from a
-failed role call. Run with:
+the prompt builders, the CSV contract, the run log's rendering, and the GER
+loop's recovery from a failed role call. Run with:
 
     uv run python -m pipeline --selftest
 
@@ -26,6 +26,12 @@ and the CLI budget override (19), the JSON extractor the live path depends on
 (20), the CSV cell renderer (21), and the two end-to-end guarantees the whole
 submission rests on — an escalated row never reaches the CSV (22), and the
 run-level breaker actually stops a bad run (23).
+
+Section 24 is the guard on this submission's central design claim — that the
+generator is never shown the SALT rule. Until it was written, that claim rested
+entirely on a comment in `prompts.py`: one added citation in the field-group
+excerpt, or one helpful edit to a brief, would have turned the graded evidence
+into an empty log with nothing failing to say so.
 """
 
 from __future__ import annotations
@@ -58,18 +64,20 @@ from .orchestrate import (
     ItemOutcome,
     RunResult,
     _csv_cell,
+    _render_text_change,
     run_item,
     run_requests,
     write_escalation,
     write_ger_log,
 )
 from .prompts import (
+    build_generator_prompt,
     build_refiner_prompt,
     load_exemplar_csv_text,
     load_exemplar_row_names,
     load_field_group_excerpt,
 )
-from .requests import ArchetypeRequest
+from .requests import REQUESTS, ArchetypeRequest
 from .schema import (
     CSV_COLUMNS,
     ArchetypeRow,
@@ -95,6 +103,22 @@ ALL_TRUE = {
     "survivable_with_resources": True,
     "minor_injuries_only": True,
 }
+
+# One real trip reason of each kind, produced by `should_trip` rather than typed
+# out as literals here. The run breaker classifies escalations by reading the
+# item breaker's reason string, so feeding it a hand-written "transport failure:
+# ..." would keep the run-level cases passing after someone renamed the prefix —
+# which is exactly the coupling those cases exist to hold.
+_TRANSPORT_TRIP = should_trip(
+    ItemBreakerState(key="_reason_fixture", transport_failures=MAX_TRANSPORT_FAILURES)
+)[1]
+_CONTENT_TRIP = should_trip(
+    ItemBreakerState(
+        key="_reason_fixture",
+        attempts=MAX_REFINE_ATTEMPTS,
+        history=[frozenset({"R1_SALT_MISMATCH"})],
+    )
+)[1]
 
 
 class _Results:
@@ -645,8 +669,8 @@ def run_selftest() -> int:
     )
 
     unhealthy = RunBreaker()
-    unhealthy.record(escalated=True)
-    unhealthy.record(escalated=True)
+    unhealthy.record(escalated=True, trip_reason=_CONTENT_TRIP)
+    unhealthy.record(escalated=True, trip_reason=_CONTENT_TRIP)
     unhealthy.record(escalated=False)
     abort, abort_reason = unhealthy.should_abort_run()
     r.check(
@@ -655,6 +679,52 @@ def run_selftest() -> int:
         f"2 of 3 escalated is {2 / 3:.0%}, above the "
         f"{RUN_ABORT_ESCALATION_RATIO:.0%} tolerance. Got abort={abort}, "
         f"reason={abort_reason!r}",
+    )
+    r.check(
+        "10b-ii an all-content abort still blames the prompt, model or rule",
+        "prompt, model, or rule" in abort_reason
+        and "transport" not in abort_reason,
+        "Nothing here is a transport failure, so the run-level diagnosis must "
+        f"be the content one it always was. Reason: {abort_reason!r}",
+    )
+
+    # The run level used to count a transport escalation identically to a
+    # content one, so a rate-limit storm that escalated 2 of 2 aborted with "a
+    # prompt, model, or rule problem for a human to resolve" — sending a human
+    # to the GDD over a dead network. That is the same misdiagnosis
+    # `should_trip` was rewritten to prevent, one level up, and the live run is
+    # exactly where it fires.
+    storm = RunBreaker()
+    storm.record(escalated=True, trip_reason=_TRANSPORT_TRIP)
+    storm.record(escalated=True, trip_reason=_TRANSPORT_TRIP)
+    storm_abort, storm_reason = storm.should_abort_run()
+    r.check(
+        "10c an all-transport abort is not reported as a content problem",
+        storm_abort
+        and storm.transport_escalated == 2
+        and "transport failure" in storm_reason
+        and "prompt, model, or rule problem" not in storm_reason,
+        "Every escalation here was a failed role call: no draft was produced "
+        "and no rule was ever checked, so the abort must say so and send the "
+        f"reader at the API key or the network. Reason: {storm_reason!r}",
+    )
+
+    mixed = RunBreaker()
+    mixed.record(escalated=True, trip_reason=_TRANSPORT_TRIP)
+    mixed.record(escalated=True, trip_reason=_CONTENT_TRIP)
+    mixed.record(escalated=False)
+    mixed_abort, mixed_reason = mixed.should_abort_run()
+    r.check(
+        "10d a mixed abort names both causes instead of picking one",
+        mixed_abort
+        and mixed.transport_escalated == 1
+        and mixed.content_escalated == 1
+        and "transport failures" in mixed_reason
+        and "content failures" in mixed_reason,
+        "Reporting a mixed run as purely one or the other hides half of what "
+        "went wrong, and the content escalation cannot be read as evidence "
+        "about the prompt until the transport problem is cleared. Reason: "
+        f"{mixed_reason!r}",
     )
 
     # ------------------------------------------------------------------
@@ -1157,6 +1227,37 @@ def run_selftest() -> int:
         + str([line for line in identical_text.splitlines() if "Changed" in line]),
     )
 
+    # A refiner that re-wraps a long authoring note without changing a word is
+    # the degenerate input to the eliding renderer: `_field_changes` sees the
+    # raw values differ and reports a change, then both sides normalise to the
+    # same string, the common prefix runs to full length, both middles come out
+    # empty and the log prints `AuthoringNote gained ''`. A real difference
+    # rendered as nothing is the precise failure this renderer was written to
+    # remove, so it must be named rather than elided.
+    rewrapped_before = (
+        "Clinically plausible placeholder — SME validation pending. Vitals "
+        "chosen to fit a femoral bleed in a warm zone with no intervention "
+        "yet applied, and thresholds left at the archetype defaults."
+    )
+    rewrapped_after = rewrapped_before.replace(" ", "\n   ", 1) + "  "
+    whitespace_render = _render_text_change(rewrapped_before, rewrapped_after)
+    r.check(
+        "17d a whitespace-only edit says so instead of rendering as nothing",
+        whitespace_render == "whitespace only (no text changed)",
+        "Re-wrapping a note changes the raw value, so a change line is emitted "
+        "either way; if the renderer degenerates it emits `gained ''`, which "
+        "reads as a difference the log could not describe. Rendered: "
+        f"{whitespace_render!r}",
+    )
+    r.check(
+        "17e a real edit to the same long note is still rendered as a diff",
+        "gained" in _render_text_change(
+            rewrapped_before, rewrapped_before + " Reviewed again."
+        ),
+        "17d must not be satisfiable by a renderer that has stopped "
+        "distinguishing long strings at all.",
+    )
+
     # ------------------------------------------------------------------
     print("")
     print("[18] A failed role call is not reported as a content problem")
@@ -1303,6 +1404,36 @@ def run_selftest() -> int:
         "correction, so the CLI refuses it with an explanation rather than "
         f"producing a run whose escalations mean nothing. Exit {rejected_exit}, "
         f"stderr {rejected_stderr.getvalue()!r}",
+    )
+
+    # Found by deliberately breaking case 24a to check it failed loudly: it did
+    # not. Its failure message contained an arrow, the console here is cp1252,
+    # cp1252 has no U+2192, and printing the message raised UnicodeEncodeError —
+    # so the run died with a codec error and never printed the finding or the
+    # summary. Every rule name and GDD quotation in this project carries em
+    # dashes, middots, ellipses or arrows, so this reaches far past one message.
+    arrow_stream = io.TextIOWrapper(io.BytesIO(), encoding="cp1252")
+    try:
+        arrow_stream.write("240 → 120")
+        arrow_stream.flush()
+        raised_before = False
+    except UnicodeEncodeError:
+        raised_before = True
+    arrow_stream.reconfigure(errors="replace")
+    try:
+        arrow_stream.write("240 → 120")
+        arrow_stream.flush()
+        raised_after = False
+    except UnicodeEncodeError:
+        raised_after = True
+    r.check(
+        "19d an unencodable character degrades instead of killing the report",
+        raised_before and not raised_after,
+        "`_make_console_printable` sets errors='replace' on stdout and stderr "
+        "before anything runs, so a check that fails still gets to say why on a "
+        "console that cannot render the characters in its message. Losing one "
+        "glyph is a cosmetic problem; losing the failure report is the whole "
+        f"report. Raised before={raised_before}, after={raised_after}.",
     )
 
     # ------------------------------------------------------------------
@@ -1511,6 +1642,81 @@ def run_selftest() -> int:
         "Every item escalated, so the CSV must be a header and nothing else — "
         "the `finally` still writes it, and writing a header-only file is the "
         f"honest output. Got:\n{abort_csv}",
+    )
+
+    # ------------------------------------------------------------------
+    print("")
+    print("[24] The generator prompt does not contain the SALT rule")
+    # ------------------------------------------------------------------
+    # This submission's central design claim — README § "The one design choice
+    # that makes this pipeline produce evidence" — had no guard at all: it was a
+    # comment in prompts.py and the author's word. One added citation in the
+    # field-group excerpt sliced out of the schema document, or one helpful edit
+    # to a brief, silently turns the graded evidence into an empty log: the
+    # exact Assignment #4 failure this pipeline was built to avoid, visible only
+    # on the live path, and announcing itself as everything passing first time.
+    #
+    # All seven prompts are checked, not just the first. Six of the seven differ
+    # only by their brief, and a brief is the likeliest place for the rule to
+    # creep back in — someone "clarifying" what makes a casualty Red.
+    gen_prompts = {
+        request.key: build_generator_prompt(request).casefold()
+        for request in REQUESTS
+    }
+    # Fingerprints of the decision tree, the derivation table and the R1 rule —
+    # not of the vocabulary. Two of them are deliberately narrower than they
+    # look, and must stay that way:
+    #   * "ground-truth category derivation" is the full § Formulas heading,
+    #     because a bare "ground-truth" appears legitimately in the excerpt's
+    #     "Group 6 — Expression bands (ground-truth hard-override thresholds)".
+    #   * "survivable_with_resources" is the snake_case SALT *input* name, not
+    #     the PascalCase `bSurvivableWithResources` column the generator is
+    #     required to author and which therefore must appear in the prompt.
+    salt_fingerprints = (
+        "derive_salt_category",
+        "ground-truth category derivation",
+        "core rule 2",
+        "obeys commands or shows purposeful movement",
+        "peripheral pulse present",
+        "not in respiratory distress",
+        "major hemorrhage controlled",
+        "survivable_with_resources",
+        "r1_salt_mismatch",
+    )
+    leaked_rule = sorted(
+        f"{key}: {fingerprint!r}"
+        for key, prompt in gen_prompts.items()
+        for fingerprint in salt_fingerprints
+        if fingerprint in prompt
+    )
+    r.check(
+        "24a the generator prompt contains no SALT decision-tree fingerprint",
+        not leaked_rule,
+        "The generator must author from the clinical brief, not from the rule "
+        "it is being graded against. If it sees the rule it self-censors, "
+        "every item passes, and ger_log.md becomes the empty evidence file "
+        f"Assignment #4 produced. Leaked: {leaked_rule}",
+    )
+
+    # 24a is satisfied by an empty string, so it is worth nothing on its own.
+    briefs_missing = [
+        request.key
+        for request in REQUESTS
+        if request.brief.casefold()[:60] not in gen_prompts[request.key]
+    ]
+    # Lower-cased because the prompts above are casefolded — the field name is
+    # `bApplyInitialVitalsOverride` in the source document and would never match.
+    schema_missing = [
+        key
+        for key, prompt in gen_prompts.items()
+        if "bapplyinitialvitalsoverride" not in prompt
+    ]
+    r.check(
+        "24b the generator prompt still carries the brief and the schema",
+        not briefs_missing and not schema_missing,
+        "24a must not be satisfiable by an empty prompt. Briefs missing from "
+        f"their prompt: {briefs_missing}. Prompts missing the field spec: "
+        f"{schema_missing}.",
     )
 
     # ------------------------------------------------------------------

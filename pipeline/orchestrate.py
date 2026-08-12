@@ -367,7 +367,9 @@ def run_requests(
             run.outcomes.append(outcome)
             print(_console_line(outcome))
 
-            run_breaker.record(escalated=outcome.escalated)
+            run_breaker.record(
+                escalated=outcome.escalated, trip_reason=outcome.trip_reason
+            )
             abort, abort_reason = run_breaker.should_abort_run()
             if abort:
                 run.aborted = True
@@ -443,7 +445,7 @@ def _fmt_number(value: float) -> str:
     importer parses these columns as floats, and ``120`` and ``120.0`` parse
     identically. What must match the exemplar byte-for-byte is the *header* —
     column names are matched verbatim or the importer silently fails to map
-    them (`data-files.md` § Carve-out) — and self-test case 11 is the guard on
+    them (`data-files.md` § Carve-out) — and self-test case 15a is the guard on
     that.
     """
     rendered = f"{value:.6g}"
@@ -562,6 +564,17 @@ def _render_text_change(old: str, new: str) -> str:
     """
     old_text = " ".join(old.split())
     new_text = " ".join(new.split())
+
+    # Both sides are whitespace-normalised above, but `_field_changes` decides a
+    # field changed using the RAW values — so a refiner that re-wraps an
+    # authoring note without altering a word arrives here with two identical
+    # strings. The eliding branch below then degenerates: the common prefix runs
+    # to full length, the common suffix pins to zero, both middles come out
+    # empty, and the log prints `AuthoringNote gained ''` — a real difference
+    # rendered as nothing, which is the exact failure this whole function was
+    # written to remove. Say what actually happened instead.
+    if old_text == new_text:
+        return "whitespace only (no text changed)"
 
     if len(old_text) <= _FULL_TEXT_LIMIT and len(new_text) <= _FULL_TEXT_LIMIT:
         return f"'{old_text}' → '{new_text}'"
@@ -1098,14 +1111,33 @@ def write_generated_notes(run: RunResult, path: Path) -> None:
         "never inline\". The hand-authored table in the game repo ships one of "
         "these; the generated table now does too.",
         "",
-        "There is a second reason specific to this pipeline. Rule R3 requires "
-        "every generated row to carry the \"clinically plausible placeholder — "
-        "SME validation pending\" label on its `AuthoringNote` — and "
-        "`AuthoringNote` is **not one of the 24 CSV columns**. Neither is the "
-        "declared SALT category, deliberately: `triage-system.md` § Summary "
-        "keeps the ground-truth category \"derived live from their Pulse "
-        "physiology state — not a static, author-placed tag\". Both live here "
-        "instead, next to the file they describe.",
+        "There is a second reason specific to this pipeline. Three things "
+        "below are **not columns of the 24-column CSV**, and each is absent "
+        "for its own documented reason, so all three live here instead, next "
+        "to the file they describe.",
+        "",
+        "1. `AuthoringNote`. Rule R3 requires every generated row to carry the "
+        "\"clinically plausible placeholder — SME validation pending\" label "
+        "on it, and the CSV has nowhere to put it.",
+        "2. The declared SALT category. Deliberately absent: "
+        "`triage-system.md` § Summary keeps the ground-truth category "
+        "\"derived live from their Pulse physiology state — not a static, "
+        "author-placed tag\".",
+        "3. `InitialConsciousness01`. Also deliberately absent, and the one "
+        "most likely to be misread as an oversight, because it is the **sole "
+        "input to SALT question (a)** — whether the casualty obeys commands "
+        "or shows purposeful movement. "
+        "`knowledge_base/casualty-archetype-schema.md` § Group 1 excludes it "
+        "from the row on purpose: \"`ConsciousnessLevel01` and `PainLevel01` "
+        "are deliberately **not** carried as initial-override fields: a "
+        "pre-insult baseline is definitionally alert and pain-free, and both "
+        "are physiology *outputs* of the pipeline (Stage 1 read / Stage 3 "
+        "derived) rather than archetype-authored inputs — carrying them here "
+        "would misrepresent them as authored config when they are computed "
+        "state.\" So the value below is authoring *intent* used to derive "
+        "ground truth, never a shipped column, and the per-row lists say "
+        "\"vitals and authoring intent\" rather than \"vitals\" for that "
+        "reason.",
         "",
         "## Placeholder-labelling status of every generated row",
         "",
@@ -1162,7 +1194,7 @@ def write_generated_notes(run: RunResult, path: Path) -> None:
             f"{_label_status(item.triage_intent.AuthoringNote)}",
             f"- **Pulse patient file**: `{item.row.PulsePatientFileName}` · "
             f"**vitals override gate**: {item.row.bApplyInitialVitalsOverride}",
-            f"- **Vitals as authored**: {_vitals_summary(item)}",
+            f"- **Vitals and authoring intent**: {_vitals_summary(item)}",
             "",
         ]
 

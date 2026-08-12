@@ -15,6 +15,15 @@ casualty is backed by the open-source **Pulse Physiology Engine**, so a
 casualty's face, breathing and behaviour are a *live clinical readout* rather
 than scripted animation.
 
+## Rubric map
+
+| Criterion | Where it is satisfied |
+|---|---|
+| **Working Pipeline** | [`orchestrate.py`](pipeline/orchestrate.py) runs the full loop with the circuit breaker and writes every artifact. `--offline`: 7 requests, 6 accepted, 1 escalated, 13 drafts, breaker tripped on the designed unfixable item. `--selftest`: 82/82, including two runs driven into a temp directory that prove an escalated row never reaches the CSV and that the run-level breaker actually stops a run. |
+| **Evaluator Quality** | [`salt.py`](pipeline/salt.py) + [`evaluator.py`](pipeline/evaluator.py) are pure Python, zero LLM — the rule is a decision tree written down in a GDD, so it is decidable, and asking a model would trade a guaranteed answer for a probabilistic one. Four rule families, each with a real catch quoted under *What the pipeline caught*, plus an escalation. Every rule names its authority: a `knowledge_base/` file and section where a document publishes it, and an explicit "physiological invariant" or engine-behaviour label where none does — never blurred. The exception is `GEN_INVALID_JSON`, not a content rule but the synthetic violation a malformed role reply becomes so the loop can retry it; it cites `pipeline/schema.py`. |
+| **Game Connection** | The content type is the real `DT_CasualtyArchetypes`, whose 24-column header the generated CSV reproduces byte-for-byte (self-test 15a guards it), shipped with the sibling notes file the project's own data rule requires. The gap is evidenced, the rule is quoted from `triage-system.md`, the field semantics and vitals gate come from the project's schema decision record, and the single escalation lands on the game's live `[To be designed]` open question. |
+| **ReadMe** | This file: the game, zero-credential commands up front, the verbatim declaration with its provenance caveat, the three bugs this found in my own evaluator, the evidenced gap, the rule with file and section, the diagram, real quoted findings, and an explicit verified-vs-not section. |
+
 ## How to run
 
 Prerequisites: [uv](https://docs.astral.sh/uv/), and an Anthropic API key for
@@ -30,7 +39,7 @@ cd golden-hour-ger-pipeline
 uv sync
 
 # Offline — no API key needed, nothing leaves the machine. Grade these two:
-uv run python -m pipeline --selftest     # 74 assertions: SALT truth table, rules, breaker, CSV contract
+uv run python -m pipeline --selftest     # 82 assertions: SALT truth table, rules, breaker, prompts, CSV contract
 uv run python -m pipeline --offline      # full GER loop with deterministic fixtures
 
 # Live run — CAUTION: this path has NEVER been executed. No API key existed in
@@ -170,6 +179,16 @@ typed. [`salt.py`](pipeline/salt.py) transcribes the decision tree with every
 branch citing its GDD line; [`evaluator.py`](pipeline/evaluator.py) derives the
 seven SALT inputs from each row's own numbers and compares.
 
+Consciousness is not a column either, and that one is worth stating outright
+because it is the *sole* input to question (a).
+[`casualty-archetype-schema.md`](knowledge_base/casualty-archetype-schema.md)
+§ Group 1 leaves it off the row on purpose — consciousness is a physiology
+**output** of the Pulse pipeline, and "carrying them here would misrepresent
+them as authored config when they are computed state". So it travels as
+authoring intent beside the declared category, never as shipped data, and the
+generated notes file lists it as the third of the file's three deliberate
+non-columns rather than leaving a reader to assume it was forgotten.
+
 One gate sits in front of all of it.
 [`casualty-archetype-schema.md`](knowledge_base/casualty-archetype-schema.md)
 § Group 1 makes `bApplyInitialVitalsOverride` the switch over the five
@@ -259,9 +278,19 @@ derived category, which the evaluator's own detail does name for the human
 reading the log. Told the answer, the loop would prove only that the pipeline
 can copy a string, no item would ever be genuinely unfixable, and the breaker
 would be unreachable. The refiner also never receives the request brief — the
-boundary that makes the escalation below unresolvable. Both constraints are
-comments in [`prompts.py`](pipeline/prompts.py) rather than discoveries waiting
-to happen.
+boundary that makes the escalation below unresolvable.
+
+Both constraints are written down as rationale in
+[`prompts.py`](pipeline/prompts.py), and both are now *enforced* rather than
+merely explained. Self-test **24** builds the generator prompt for all seven
+requests and fails if any of them carries a fingerprint of the decision tree,
+the derivation table or the R1 rule; self-test **4d** builds the refiner prompt
+from a real failing item and fails if the derived category survives into it.
+Before 24 existed, the claim in bold above was a comment and my word: one added
+citation in the schema excerpt the prompt slices, or one helpful edit to a
+brief, would have quietly reproduced the Assignment #4 outcome — and it would
+have announced itself as every item passing first time, which reads like
+success.
 
 ## What it produces
 
@@ -288,10 +317,11 @@ to prove it.
 Quotes below are copied from [`ger_log.md`](output/ger_log.md) as generated.
 
 **The headline is in the data:** the seven requests span all five SALT
-categories; six generate cleanly; the one that escalates is the Gray/Expectant
-casualty — precisely the category `triage-system.md` § Formulas still flags
-`[To be designed]`, with no resource model behind it. **The pipeline's only
-failure is the game's own open question.**
+categories; one generates cleanly and five are repaired on a single refine; the
+one that escalates is the Gray/Expectant casualty — precisely the category
+`triage-system.md` § Formulas still flags `[To be designed]`, with no resource
+model behind it. **The pipeline's only failure is the game's own open
+question.**
 
 **1. The Pre-Build Declaration's own failure, caught (`abdominal_evisceration`).**
 `R1_SALT_MISMATCH` on the first evaluation. The draft declared **Yellow** with
@@ -307,9 +337,10 @@ RR 34 (distress threshold 30), BP 68/44 (pulse-absent below 70), consciousness
 Exactly the row the declaration predicted: valid CSV, imports clean, looks
 plausible, and would have told a trainee who correctly called Red that they
 over-triaged. The refiner corrected the **vitals** rather than the declaration —
-right here, because the brief describes a casualty "awake and tracking you" with
-a "pulse present at the wrist" and no active bleeding. The log records what
-changed (`InitialRespirationRateBpm 34 → 18; InitialSystolicBP 68 → 106;
+right here, because the brief describes a casualty "awake and tracking you",
+whose "pulse is present at the wrist", carrying a wound that "is not actively
+pouring blood right now". The log records what changed
+(`InitialRespirationRateBpm 34 → 18; InitialSystolicBP 68 → 106;
 HemorrhageInsultMagnitude01 0.45 → 0; InitialConsciousness01 0.15 → 0.8`, among
 others). Accepted after one refine.
 
@@ -369,15 +400,6 @@ to the existing hand-authored casualty raised zero violations on its first draft
 That is at least one real catch from each of the four rule families, five
 successful refines, and one escalation.
 
-## Rubric map
-
-| Criterion | Where it is satisfied |
-|---|---|
-| **Working Pipeline** | [`orchestrate.py`](pipeline/orchestrate.py) runs the full loop with the circuit breaker and writes every artifact. `--offline`: 7 requests, 6 accepted, 1 escalated, 13 drafts, breaker tripped on the designed unfixable item. `--selftest`: 74/74, including two runs driven into a temp directory that prove an escalated row never reaches the CSV and that the run-level breaker actually stops a run. |
-| **Evaluator Quality** | [`salt.py`](pipeline/salt.py) + [`evaluator.py`](pipeline/evaluator.py) are pure Python, zero LLM — the rule is a decision tree written down in a GDD, so it is decidable, and asking a model would trade a guaranteed answer for a probabilistic one. Four rule families, each with a real catch above, plus an escalation. Every rule names its authority: a `knowledge_base/` file and section where a document publishes it, and an explicit "physiological invariant" or engine-behaviour label where none does — never blurred. The exception is `GEN_INVALID_JSON`, not a content rule but the synthetic violation a malformed role reply becomes so the loop can retry it; it cites `pipeline/schema.py`. |
-| **Game Connection** | The content type is the real `DT_CasualtyArchetypes`, whose 24-column header the generated CSV reproduces byte-for-byte (self-test 15a guards it), shipped with the sibling notes file the project's own data rule requires. The gap is evidenced, the rule is quoted from `triage-system.md`, the field semantics and vitals gate come from the project's schema decision record, and the single escalation lands on the game's live `[To be designed]` open question. |
-| **ReadMe** | This file: the game, zero-credential commands up front, the verbatim declaration with its provenance caveat, the three bugs this found in my own evaluator, the evidenced gap, the rule with file and section, the diagram, real quoted findings, and an explicit verified-vs-not section. |
-
 ## Repo layout
 
 | Path | Purpose |
@@ -392,7 +414,7 @@ successful refines, and one escalation.
 | [`refiner.py`](pipeline/refiner.py) | Live refiner and the offline fixture |
 | [`breaker.py`](pipeline/breaker.py) | Per-item `should_trip` + run-level `RunBreaker` |
 | [`orchestrate.py`](pipeline/orchestrate.py) | The GER loop and every output writer |
-| [`selftest.py`](pipeline/selftest.py) | 74 offline assertions |
+| [`selftest.py`](pipeline/selftest.py) | 82 offline assertions |
 | [`__main__.py`](pipeline/__main__.py) | CLI + top-level error guard |
 
 ## What is verified vs. not
@@ -400,7 +422,7 @@ successful refines, and one escalation.
 **Verified by running it, on this machine:**
 
 - `uv sync` on pinned Python 3.13 (system default here is 3.14) — 16 packages.
-- `--selftest`: **74/74 pass, exit 0** — including the GDD's worked example, the
+- `--selftest`: **82/82 pass, exit 0** — including the GDD's worked example, the
   question-(c) inversion guard, the two mutation guards, the vitals gate, the
   JSON extractor against fenced / prose-wrapped / brace-in-string /
   escaped-quote / no-JSON / truncated input, and the two end-to-end runs above.
@@ -417,12 +439,28 @@ successful refines, and one escalation.
   `escalations/severe_tbi_expectant.md`. `ger_log.md`, the notes file and
   `run_summary.json` differ only by the timestamp each records.
 - Every module imports cleanly; `python -m compileall -f pipeline` is clean.
-- The live path's non-network parts: the fail-fast missing-key guard, both
-  prompt builders, the SALT-rule leak check, the derived-category redaction,
-  schema rejection, and the two knowledge-base loaders only the live generator
-  uses (self-test 14 — unreachable from either offline command, so a heading
-  edit in the copied schema document would otherwise break the live path alone,
-  on its first call).
+- **Self-test 24 was mutation-tested rather than assumed.** On a scratch copy I
+  cited the SALT rule inside the schema excerpt the prompt slices, and
+  separately leaked a rule variable into one request brief: 24a failed both
+  times, and emptying the prompt failed 24b instead. That exercise also found
+  something real — the failure *message* named the leak with an arrow, this
+  console is cp1252, and printing it raised a codec error that killed the run
+  before it could print the finding or the summary. A failing check that cannot
+  say why is worth nothing, so stdout and stderr now substitute unencodable
+  characters instead of raising; self-test 19d holds that.
+- The live path's non-network parts. **Both prompt builders are built and
+  inspected by name, not merely imported.** Self-test **24** builds the
+  generator prompt for all seven requests and asserts none of them contains a
+  fingerprint of the SALT decision tree, the derivation table or the R1 rule —
+  the guard on the design claim above, which until now was only a comment in
+  `prompts.py`; **24b** asserts each prompt still carries its brief and the
+  field spec, so 24a cannot be satisfied by an empty prompt. Self-test **4d**
+  builds the refiner prompt from a real failing item and asserts none of the
+  five derived-category disclosure sentences survives into it. Also covered:
+  the fail-fast missing-key guard, schema rejection, and the two knowledge-base
+  loaders only the live generator uses (self-test 14 — unreachable from either
+  offline command, so a heading edit in the copied schema document would
+  otherwise break the live path alone, on its first call).
 - `architecture.mmd` renders (validated with `mmdc`); self-test 15b asserts the
   embedded copy matches it.
 
