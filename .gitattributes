@@ -1,0 +1,15 @@
+# Every text file this repo authors is LF-terminated, on every platform.
+#
+# The generated artifacts under output/ are graded evidence and are committed.
+# Without this, a checkout on Windows would rewrite them to CRLF and the next
+# run — which writes LF explicitly — would report the whole file as changed.
+* text=auto eol=lf
+
+# EXCEPT the knowledge base. Those files are byte-for-byte copies of documents
+# in the Golden Hour game repo, and several of them are CRLF there. Line-ending
+# normalisation would silently make them no longer byte-for-byte copies, which
+# is the one property they are shipped for. `-text` disables all conversion, so
+# the bytes committed and checked out are the bytes that were copied in.
+# It also protects the exemplar CSV, whose header is compared byte-for-byte
+# against the generated one.
+knowledge_base/** -text

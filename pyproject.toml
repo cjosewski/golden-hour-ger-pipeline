@@ -1,0 +1,22 @@
+[project]
+name = "golden-hour-ger-pipeline"
+version = "0.1.0"
+description = "Generator-Evaluator-Refiner pipeline with a circuit breaker, generating casualty archetype rows for Golden Hour (ELVTR Multi-Agent AI for Game Development, Assignment #6)"
+authors = [{ name = "Chad Josewski" }]
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    # Native Anthropic provider — same family as Assignment #4's generator/critic
+    # calls; here it drives the Generator and Refiner roles of the GER loop.
+    "anthropic>=0.40",
+    # Structured-output validation for every generated archetype row. The row
+    # model is also the single source of truth for the CSV column order, so the
+    # generated DataTable source cannot drift from the exemplar header.
+    "pydantic>=2",
+]
+
+# Non-package project: uv installs the locked dependency set into .venv but does
+# not build/install this repo as a wheel. The pipeline runs as a module from the
+# repo root (`uv run python -m pipeline ...`), so no build backend and no
+# README-at-build-time requirement — the repo stays clone-and-run.
+[tool.uv]
+package = false

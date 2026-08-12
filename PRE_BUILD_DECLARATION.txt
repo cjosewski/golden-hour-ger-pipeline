@@ -1,0 +1,17 @@
+Game: Golden Hour — VR mass-casualty triage trainer (Unreal 5.8).
+
+1. Content type: casualty archetype rows for DT_CasualtyArchetypes — the
+23-field rows defining each casualty's injury, Pulse patient file, starting
+vitals, and assessment thresholds. The POC needs 5–15 (casualty-model.md);
+one is hand-authored today.
+
+2. GDD rule: triage-system.md, derive_salt_category — ground-truth SALT
+category is derived from breathing, command response, peripheral pulse,
+respiratory distress (RR>30) and hemorrhage control, never author-placed.
+A row's declared category must equal the category its own vitals derive.
+
+3. Failure: a row with RR 34, SBP 68, unresponsive, uncontrolled bleed,
+labeled Delayed/Yellow. Valid CSV, imports clean, looks plausible. In play
+the trainee correctly calls Red; scoring-and-debrief.md grades that call
+against Yellow ground truth and tells a competent trainee they
+over-triaged. The bug is invisible until debrief blames the student.

@@ -1,0 +1,53 @@
+flowchart TD
+    KB[("knowledge_base/ — copied in, self-contained<br/><b>Read at runtime:</b> casualty-archetype-schema.md<br/>(Group 1-7 field spec) + the real one-row<br/>DT_CasualtyArchetypes CSV<br/><b>Shipped as cited authority:</b> 6 further GDD<br/>and data-rule documents")]
+    REQ["requests.py<br/>(7 archetype requests<br/>spanning the SALT space)"]
+
+    subgraph GEN["Generate (generator.py)"]
+        G["Generator role<br/>(anthropic SDK / offline fixture)<br/>exemplar row + field-group semantics<br/>+ clinical brief<br/><b>NO SALT rule in this prompt</b>"]
+    end
+
+    subgraph EVAL["Evaluate — pure Python, ZERO LLM"]
+        DERIVE["derive_inputs_from_row<br/>(row vitals + thresholds<br/>-> 7 SALT booleans)<br/>gated on bApplyInitialVitalsOverride"]
+        SALT["salt.py<br/>derive_salt_category<br/>(triage-system.md Core Rule 2)"]
+        RULES["evaluator.py<br/>R1 SALT coherence<br/>R2 tuning-knob bands<br/>R3 placeholder label<br/>R4 schema integrity<br/><i>names each authority as a literal;<br/>opens no knowledge_base file</i>"]
+        DERIVE --> SALT
+        SALT --> RULES
+    end
+
+    subgraph REF["Refine (refiner.py)"]
+        R["Refiner role<br/>(anthropic SDK / offline fixture)<br/>failing item + violations only<br/><b>derived category redacted</b><br/><b>request brief withheld</b>"]
+    end
+
+    subgraph CB["Circuit Breaker (breaker.py)"]
+        ITEM["should_trip<br/>1. attempts >= MAX_REFINE_ATTEMPTS<br/>2. no progress (same codes twice)<br/>3. regression (violations grew)"]
+        RUN["RunBreaker.should_abort_run<br/>escalation ratio > 50%<br/>after 2+ completed items"]
+    end
+
+    KB -->|"exemplar row + field-group excerpt"| G
+    REQ --> G
+    G -->|"draft item"| DERIVE
+    G -.->|"unparseable reply -><br/>synthetic GEN_INVALID_JSON,<br/>retry the same role"| ITEM
+    R -.->|"unparseable reply -><br/>synthetic GEN_INVALID_JSON,<br/>retry the same role"| ITEM
+
+    RULES -->|"passed"| ACCEPT{{"Accept"}}
+    RULES -->|"violations"| ITEM
+    ITEM -->|"no trip"| R
+    R -->|"revised item"| DERIVE
+    ITEM -->|"TRIP"| ESC{{"Escalate<br/>(never written to the CSV)"}}
+
+    ACCEPT --> RUN
+    ESC --> RUN
+    RUN -->|"abort"| STOP["Stop the run loudly —<br/>a prompt/model/rule problem<br/>for a human"]
+
+    ACCEPT --> WRITE
+    ESC --> WRITE
+    STOP --> WRITE
+    WRITE[["write_outputs — runs in a finally,<br/>so a run that dies mid-way still<br/>ships everything completed"]]
+
+    WRITE --> CSV[("output/DT_CasualtyArchetypes.generated.csv<br/>accepted rows only, 24 columns,<br/>header identical to the exemplar")]
+    WRITE --> JSON[("output/archetypes.json<br/>rows + triage_intent")]
+    WRITE -->|"every draft, every finding"| LOG[("output/ger_log.md")]
+    WRITE --> ESCFILE[("output/escalations/&lt;key&gt;.md<br/>trip reason + attempt history<br/>+ the decision a human must make")]
+    WRITE --> SUMMARY[("output/run_summary.json")]
+
+    CSV --> GAME["Golden Hour (UE 5.8)<br/>DT_CasualtyArchetypes<br/>casualty archetype rows"]

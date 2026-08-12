@@ -1,0 +1,20 @@
+{
+  "mode": "offline",
+  "model": "offline-deterministic-fixture",
+  "requested": 7,
+  "processed": 7,
+  "accepted": 6,
+  "escalated": 1,
+  "total_attempts": 13,
+  "total_refine_attempts": 6,
+  "total_role_calls": 13,
+  "generator_calls": 7,
+  "refiner_calls": 6,
+  "run_aborted": false,
+  "abort_reason": "",
+  "max_refine_attempts": 3,
+  "escalated_keys": [
+    "severe_tbi_expectant"
+  ],
+  "generated_at": "2026-08-12T18:32:57+00:00"
+}

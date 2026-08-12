@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+
+# Secrets — the API key lives in the environment or an untracked .env,
+# never in git
+.env
+
+# NOTE: output/ is deliberately NOT ignored. output/ger_log.md,
+# output/escalations/*.md and output/run_summary.json ARE the graded evidence
+# for Working Pipeline and Evaluator Quality — after a run they must be
+# committable, so nothing under output/ is excluded here.
+
+# OMC assistant scratch state
+.omc/
