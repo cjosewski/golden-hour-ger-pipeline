@@ -19,8 +19,8 @@ than scripted animation.
 
 | Criterion | Where it is satisfied |
 |---|---|
-| **Working Pipeline** | [`orchestrate.py`](pipeline/orchestrate.py) runs the full loop with the circuit breaker and writes every artifact. `--offline`: 7 requests, 6 accepted, 1 escalated, 13 drafts, breaker tripped on the designed unfixable item. `--selftest`: 84/84, including two runs driven into a temp directory that prove an escalated row never reaches the CSV and that the run-level breaker actually stops a run. |
-| **Evaluator Quality** | [`salt.py`](pipeline/salt.py) + [`evaluator.py`](pipeline/evaluator.py) are pure Python, zero LLM — the rule is a decision tree written down in a GDD, so it is decidable, and asking a model would trade a guaranteed answer for a probabilistic one. Four rule families, each with a real catch quoted under *What the pipeline caught*, plus an escalation. Every rule names its authority: a `knowledge_base/` file and section where a document publishes it, and an explicit "physiological invariant" or engine-behaviour label where none does — never blurred. The exception is `GEN_INVALID_JSON`, not a content rule but the synthetic violation a malformed role reply becomes so the loop can retry it; it cites `pipeline/schema.py`. |
+| **Working Pipeline** | [`orchestrate.py`](pipeline/orchestrate.py) runs the full loop with the circuit breaker and writes every artifact. `--offline`: 7 requests, 6 accepted, 1 escalated, 13 drafts, breaker tripped on the designed unfixable item. `--selftest`: 84/84, including two runs driven into a temp directory that prove an escalated row never reaches the CSV and that the run-level breaker actually stops a run. **Live against `claude-sonnet-4-5`**: 7 requested, 5 accepted, 2 escalated, 16 drafts, 16 role calls, breaker tripped on the no-progress policy — same code path, no fixtures ([`output-live/`](output-live)). |
+| **Evaluator Quality** | [`salt.py`](pipeline/salt.py) + [`evaluator.py`](pipeline/evaluator.py) are pure Python, zero LLM — the rule is a decision tree written down in a GDD, so it is decidable, and asking a model would trade a guaranteed answer for a probabilistic one. Four rule families, each with a real catch quoted under *What the pipeline caught*, plus an escalation — and each with a second, independent catch against live model output under *What the live run caught*, including a row-key collision with the shipped table that no clinical review would have flagged. Every rule names its authority: a `knowledge_base/` file and section where a document publishes it, and an explicit "physiological invariant" or engine-behaviour label where none does — never blurred. The exception is `GEN_INVALID_JSON`, not a content rule but the synthetic violation a malformed role reply becomes so the loop can retry it; it cites `pipeline/schema.py`. |
 | **Game Connection** | The content type is the real `DT_CasualtyArchetypes`, whose 24-column header the generated CSV reproduces byte-for-byte (self-test 15a guards it), shipped with the sibling notes file the project's own data rule requires. The gap is evidenced, the rule is quoted from `triage-system.md`, the field semantics and vitals gate come from the project's schema decision record, and the single escalation lands on the game's live `[To be designed]` open question. |
 | **ReadMe** | This file: the game, zero-credential commands up front, the verbatim declaration with its provenance caveat, the three bugs this found in my own evaluator, the evidenced gap, the rule with file and section, the diagram, real quoted findings, and an explicit verified-vs-not section. |
 
@@ -42,11 +42,11 @@ uv sync
 uv run python -m pipeline --selftest     # 84 assertions: SALT truth table, rules, breaker, prompts, CSV contract
 uv run python -m pipeline --offline      # full GER loop with deterministic fixtures
 
-# Live run — CAUTION: this path has NEVER been executed. No API key existed in
-# the build environment, so the network round trip is untested; see "What is
-# verified vs. not". Grade --offline, not this.
+# Live run — EXECUTED 2026-08-18 against `claude-sonnet-4-5`; see "What the live run
+# caught". --out keeps it clear of the committed offline artifacts, which the
+# sections below quote by count and line. Grade --offline if you have no key.
 $env:ANTHROPIC_API_KEY = "sk-ant-your-key"
-uv run python -m pipeline
+uv run python -m pipeline --out output-live
 ```
 
 `--max-attempts N` overrides the breaker's per-item refine budget; `--out DIR`
@@ -306,6 +306,11 @@ success.
 | [`escalations/<key>.md`](output/escalations/severe_tbi_expectant.md) | Per tripped item: the trip reason, the attempt history, the decision a human has to make |
 | [`run_summary.json`](output/run_summary.json) | Counts: requested, accepted, escalated, attempts, role calls, mode, model |
 
+The same six artifacts are written for every run. [`output/`](output) holds the
+deterministic offline run a grader can reproduce with no API key;
+[`output-live/`](output-live) holds the live run against a real model. Both are
+committed, and neither overwrites the other.
+
 All are written from a `finally`, so a run that dies part-way still ships
 everything that completed. An escalated row is **never** written to the CSV: a
 row the pipeline knows is incoherent is worse than a missing row, because it
@@ -325,6 +330,10 @@ one that escalates is the Gray/Expectant casualty — precisely the category
 `triage-system.md` § Formulas still flags `[To be designed]`, with no resource
 model behind it. **The pipeline's only failure is the game's own open
 question.**
+
+> **That sentence is true of the fixtures and is not a claim about any model.**
+> The live run below escalated two different rows and *accepted* this one — see
+> [What the live run caught](#what-the-live-run-caught).
 
 **1. The Pre-Build Declaration's own failure, caught (`abdominal_evisceration`).**
 `R1_SALT_MISMATCH` on the first evaluation. The draft declared **Yellow** with
@@ -403,6 +412,115 @@ to the existing hand-authored casualty raised zero violations on its first draft
 That is at least one real catch from each of the four rule families, five
 successful refines, and one escalation.
 
+## What the live run caught
+
+`uv run python -m pipeline --out output-live` → **7 requested, 5 accepted, 2
+escalated, 16 drafts evaluated, 16 role calls** (7 generator + 9 refiner)
+([`run_summary.json`](output-live/run_summary.json)). Model
+`claude-sonnet-4-5`, run `2026-08-18T01:32:09Z`. Quotes below are copied from
+[`ger_log.md`](output-live/ger_log.md) as generated, and every count in this
+section is read out of those artifacts rather than typed.
+
+A real model, with no fixture anywhere in the loop. It is reported *beside*
+the offline run rather than in place of it: [`output/`](output) is untouched,
+so every count and quote in the sections above still describes the file it
+cites.
+
+**The live run does not reproduce the offline headline, and that is the most
+useful thing in it.** Offline, the only escalation is the Gray/Expectant
+casualty and the story is *"the pipeline's only failure is the game's own open
+question."* Live, that casualty was **accepted** after one refine, and both
+escalations landed somewhere else entirely. Offline, `ied_leg_hemorrhage_t1`
+is the clean control that passes first time; live, it is the row that tried to
+overwrite existing game content. The fixtures were honest about the *loop*.
+They were never evidence about a *model* — which is what the offline section
+says of itself, and what this run now demonstrates rather than asserts.
+
+**1. First-pass acceptances: 0 of 7.** Every item took at least one refine.
+The verified-vs-not section used to pose this as the open question a live run
+would settle — *how many pass first time with no SALT rule in their prompt* —
+because a generator that never erred would make the evaluator decorative. The
+answer is none of them, and they did not all break the same rule.
+
+**2. The best catch of the run: a row key that would have silently destroyed
+live game content (`ied_leg_hemorrhage_t1`, `R4_DUPLICATE_NAME`).** The
+generator named its row `Casualty_IED_LegHemorrhage_T1` — which is *already
+the row key in the shipped table*:
+
+> Row name 'Casualty_IED_LegHemorrhage_T1' is already taken — either by a row
+> accepted earlier in this run, or by the row already in the live table. Unreal
+> keys DataTable rows by Name; a duplicate silently overwrites the earlier row
+> on import.
+
+Nothing about that row is clinically wrong, so a clinical reviewer would have
+passed it, and the CSV imports without a warning. It is precisely the failure
+a human reviewing generated content is worst at seeing and a mechanical check
+is best at. The refiner renamed it to `Casualty_IED_FemoralHemorrhage_T1_Red`
+and the row was accepted.
+
+**3. Both escalations are the same misconception reached by two different
+wrong routes — and the evaluator refused both.** [`salt.py`](pipeline/salt.py)
+derives criterion (d) as `HemorrhageInsultMagnitude01 <= 0.0`, because a row
+describes the casualty **at spawn, before any treatment**: at spawn, any
+nonzero bleed is by definition not yet controlled. Both drafts assumed instead
+that a *small* bleed counts as controlled, and each refine chain then chased
+that assumption instead of the row:
+
+- **`ambulatory_lac_forearm`** (declared Green, derived Red) went after
+  `HemorrhageControlledFlowThreshold`, raising it 10 → 50 → 150 mL/min — a field
+  the derivation never reads. By the third attempt it had written the intent
+  into the row itself: *"HemorrhageControlledFlowThreshold raised to 150.0 mL/min
+  to ensure SALT major hemorrhage controlled criterion (d) resolves true for
+  Green category derivation."* That is a draft openly optimising for the checker
+  rather than for the casualty, and the checker did not move.
+- **`abdominal_evisceration`** (declared Yellow, derived Red) went after the
+  right field and still could not land it, walking `HemorrhageInsultMagnitude01`
+  0.35 → 0.25 → 0.05 — asymptotic toward a threshold that is exactly `0.0`.
+
+Neither is resolvable from inside the loop **by construction**. The Refiner
+receives the failing row and the violations against it, never the request
+brief (the prompt-isolation boundary documented in
+[`prompts.py`](pipeline/prompts.py)), so it cannot know that the forearm ooze
+the brief calls *"essentially stopped"* should be authored as a bleed of
+exactly zero. That boundary is what makes the circuit breaker reachable rather
+than decorative, and this is the first evidence that a real model reaches it —
+not only a fixture built to.
+
+**4. The provenance rule fired on all 7 items
+(`R3_MISSING_PLACEHOLDER_LABEL`), and the refiner fixed all 7.** The model
+always volunteered *some* provenance disclaimer and never the required one —
+"requiring SME validation", "vitals pending SME validation", "pending SME
+validation" — where R3 looks for the phrase `SME validation pending`. It is
+the least clinically interesting catch in the run and the most consistent one:
+unlabelled placeholders are exactly what reaches a designer looking like
+validated clinical data, and not one draft in 7 shipped the label unprompted.
+
+**5. `R4_EMPTY_SITE_TAG` on the burn casualty (`flash_burn_forearms`).** With
+no hemorrhage to site, the generator left `HemorrhageSiteTag` blank. Per Group
+2 of the schema record that field "drives which limb's wound visual and
+tourniquet snap volume are active on BP_Casualty", so blank ships a casualty
+with no wound visual and nowhere to apply a tourniquet. The refiner set it to
+`None` — Unreal's own spelling for an empty `name`, not a stray string.
+`R2_TOURNIQUET_WINDOW_BAND` fired on 3 items, with windows of 600s, 300s and
+0s against a documented 60–180 band.
+
+**6. The breaker tripped on the policy it was designed for, and the run-level
+breaker correctly did not fire.** Both escalations tripped the *no-progress*
+policy — the same rule breaking on two consecutive attempts — not the attempt
+budget. That is the distinction the breaker exists to make: an item the
+refiner is genuinely converging on gets its budget; an item it is circling
+does not. At 2 of 7 escalated (29%), the run-level tolerance of 50% was not
+reached, so `run_aborted` is `false` and the 5 good rows shipped. A breaker
+that stopped this run would have been wrong, and it didn't.
+
+**What this run still does not show.** It is one run of one model at default
+sampling — no claim here is a rate, and nothing in it says how often a model
+does any of this. The generated vitals remain clinically plausible
+placeholders with SME validation pending; the pipeline checks internal
+coherence with the GDD, which is not clinical correctness. And
+`output-live/DT_CasualtyArchetypes.generated.csv` has still never been
+imported into UE 5.8, exactly as the offline artifact has not.
+
 ## Repo layout
 
 | Path | Purpose |
@@ -469,16 +587,17 @@ successful refines, and one escalation.
 
 **Not verified here:**
 
-- **The live Anthropic run.** No API key exists in this environment, so no
-  request has ever been sent. `LiveGenerator` and `LiveRefiner` are written,
-  import-clean and syntax-checked, and the SDK call shape was checked against
-  current `anthropic-sdk-python` documentation — but the network round trip,
-  real model output and real parsing of it are untested. What a real run would
-  add, from `ger_log.md`: the best genuine R1 catch; how many of the seven
-  passed first time with no SALT rule in their prompt (the real measure of
-  whether the rule needed enforcing); whether a refine corrected the declaration
-  or the vitals; whether the breaker tripped, and on which policy; and any false
-  positive, in the spirit of `R2_BP_ORDER` above.
+- ~~**The live Anthropic run.**~~ **Executed 2026-08-18** — see
+  [What the live run caught](#what-the-live-run-caught) and
+  [`output-live/`](output-live). Every question this bullet used to pose is now
+  answered from artifacts rather than reasoning: 0 of 7 passed first time;
+  the best genuine catch was `R4_DUPLICATE_NAME` against a row key already in the
+  shipped table; the two R1 failures were corrected in neither direction and
+  escalated; the breaker tripped on the no-progress policy both times, and the
+  run-level breaker correctly did not fire. No false positive was observed.
+  **What remains unverified about the live path is anything rate-like** — this is
+  one run of one model at default sampling, so it establishes that these things
+  happen, never how often.
 - **Import into the real Unreal DataTable.** The header is byte-identical to the
   file that already imports and the column order is derived from the row model,
   but nobody has imported the generated file into UE 5.8 and confirmed all 24

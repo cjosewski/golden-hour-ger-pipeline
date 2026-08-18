@@ -1,0 +1,21 @@
+{
+  "mode": "live",
+  "model": "claude-sonnet-4-5",
+  "requested": 7,
+  "processed": 7,
+  "accepted": 5,
+  "escalated": 2,
+  "total_attempts": 16,
+  "total_refine_attempts": 9,
+  "total_role_calls": 16,
+  "generator_calls": 7,
+  "refiner_calls": 9,
+  "run_aborted": false,
+  "abort_reason": "",
+  "max_refine_attempts": 3,
+  "escalated_keys": [
+    "ambulatory_lac_forearm",
+    "abdominal_evisceration"
+  ],
+  "generated_at": "2026-08-18T01:32:09+00:00"
+}
